@@ -1,0 +1,81 @@
+# usage: thanos sidecar [<flags>]
+# 
+# sidecar for Prometheus server
+# 
+# Flags:
+#   -h, --help                     Show context-sensitive help (also try
+#                                  --help-long and --help-man).
+#       --version                  Show application version.
+#       --log.level=info           Log filtering level.
+#       --log.format=logfmt        Log format to use. Possible options: logfmt or
+#                                  json.
+#       --tracing.config-file=<file-path>  
+#                                  Path to YAML file with tracing configuration.
+#                                  See format details:
+#                                  https://thanos.io/tracing.md/#configuration
+#       --tracing.config=<content>  
+#                                  Alternative to 'tracing.config-file' flag
+#                                  (lower priority). Content of YAML file with
+#                                  tracing configuration. See format details:
+#                                  https://thanos.io/tracing.md/#configuration
+#       --http-address="0.0.0.0:10902"  
+#                                  Listen host:port for HTTP endpoints.
+#       --http-grace-period=2m     Time to wait after an interrupt received for
+#                                  HTTP Server.
+#       --grpc-address="0.0.0.0:10901"  
+#                                  Listen ip:port address for gRPC endpoints
+#                                  (StoreAPI). Make sure this address is routable
+#                                  from other components.
+#       --grpc-grace-period=2m     Time to wait after an interrupt received for
+#                                  GRPC Server.
+#       --grpc-server-tls-cert=""  TLS Certificate for gRPC server, leave blank to
+#                                  disable TLS
+#       --grpc-server-tls-key=""   TLS Key for the gRPC server, leave blank to
+#                                  disable TLS
+#       --grpc-server-tls-client-ca=""  
+#                                  TLS CA to verify clients against. If no client
+#                                  CA is specified, there is no client
+#                                  verification on server side. (tls.NoClientCert)
+#       --prometheus.url=http://localhost:9090  
+#                                  URL at which to reach Prometheus's API. For
+#                                  better performance use local network.
+#       --prometheus.ready_timeout=10m  
+#                                  Maximum time to wait for the Prometheus
+#                                  instance to start up
+#       --receive.connection-pool-size=RECEIVE.CONNECTION-POOL-SIZE  
+#                                  Controls the http MaxIdleConns. Default is 0,
+#                                  which is unlimited
+#       --receive.connection-pool-size-per-host=100  
+#                                  Controls the http MaxIdleConnsPerHost
+#       --tsdb.path="./data"       Data directory of TSDB.
+#       --reloader.config-file=""  Config file watched by the reloader.
+#       --reloader.config-envsubst-file=""  
+#                                  Output file for environment variable
+#                                  substituted config file.
+#       --reloader.rule-dir=RELOADER.RULE-DIR ...  
+#                                  Rule directories for the reloader to refresh
+#                                  (repeated field).
+#       --objstore.config-file=<file-path>  
+#                                  Path to YAML file that contains object store
+#                                  configuration. See format details:
+#                                  https://thanos.io/storage.md/#configuration
+#       --objstore.config=<content>  
+#                                  Alternative to 'objstore.config-file' flag
+#                                  (lower priority). Content of YAML file that
+#                                  contains object store configuration. See format
+#                                  details:
+#                                  https://thanos.io/storage.md/#configuration
+#       --shipper.upload-compacted  
+#                                  If true sidecar will try to upload compacted
+#                                  blocks as well. Useful for migration purposes.
+#                                  Works only if compaction is disabled on
+#                                  Prometheus. Do it once and then disable the
+#                                  flag when done.
+#       --min-time=0000-01-01T00:00:00Z  
+#                                  Start of time range limit to serve. Thanos
+#                                  sidecar will serve only metrics, which happened
+#                                  later than this value. Option can be a constant
+#                                  time in RFC3339 format or time duration
+#                                  relative to current time, such as -1d or 2h45m.
+#                                  Valid duration units are ms, s, m, h, d, w, y.
+# 

@@ -1,0 +1,15 @@
+[Unit]
+Description=Thanos sidecar
+Documentation=https://github.com/improbable-eng/thanos/
+
+[Service]
+Restart=always
+User=thanos
+EnvironmentFile=/etc/default/thanos-sidecar
+ExecStart=/usr/bin/thanos sidecar $ARGS
+ExecReload=/bin/kill -HUP $MAINPID
+TimeoutStopSec=20s
+SendSIGKILL=no
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,15 @@
+[Unit]
+Description=Thanos compact
+Documentation=https://github.com/improbable-eng/thanos/
+
+[Service]
+Restart=always
+User=thanos
+EnvironmentFile=/etc/default/thanos-compact
+ExecStart=/usr/bin/thanos compact $ARGS
+ExecReload=/bin/kill -HUP $MAINPID
+TimeoutStopSec=20s
+SendSIGKILL=no
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,34 @@
+#!/usr/bin/make -f
+
+# Generate default files from command help
+# for c in sidecar store query compact ; do
+#   ./thanos $c --help 2>&1 | sed 's@^@# @' > debian/thanos.thanos-${c}.default
+# done
+
+export HOME := $(shell mktemp -d /tmp/thanos-build.XXXXXX)
+export GOPATH := $(HOME)/go
+export PATH := $(GOPATH)/bin:/usr/lib/go-1.12/bin:$(PATH)
+
+export THANOS_SKIP_S3_AWS_TESTS="true"
+export THANOS_SKIP_AZURE_TESTS="true"
+export THANOS_SKIP_SWIFT_TESTS="true"
+export THANOS_SKIP_TENCENT_COS_TESTS="true"
+export THANOS_SKIP_GCS_TESTS="true"
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	make -j4 build
+
+override_dh_auto_clean:
+	dh_auto_clean
+	rm -f thanos config_*.txt
+
+override_dh_auto_test:
+
+override_dh_installinit:
+	dh_installinit --no-enable --name thanos-sidecar
+	dh_installinit --no-enable --name thanos-store
+	dh_installinit --no-enable --name thanos-query
+	dh_installinit --no-enable --name thanos-compact

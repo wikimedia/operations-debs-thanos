@@ -1,0 +1,9 @@
+Source: thanos
+Maintainer: Filippo Giunchedi <fgiunchedi@wikimedia.org>
+Build-Depends: adduser, debhelper (>= 12), golang, git, bzr, ca-certificates
+Standards-Version: 4.5.0
+
+Package: thanos
+Architecture: any
+Depends: ${misc:Depends}, ${shlibs:Depends},
+Description: Prometheus long term storage solution

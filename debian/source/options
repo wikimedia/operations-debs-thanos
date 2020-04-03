@@ -1,0 +1,3 @@
+--tar-ignore=tags
+--tar-ignore=thanos/thanos
+--tar-ignore=.git

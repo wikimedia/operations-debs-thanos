@@ -1,0 +1,134 @@
+# usage: thanos store [<flags>]
+# 
+# store node giving access to blocks in a bucket provider. Now supported GCS, S3,
+# Azure, Swift and Tencent COS.
+# 
+# Flags:
+#   -h, --help                     Show context-sensitive help (also try
+#                                  --help-long and --help-man).
+#       --version                  Show application version.
+#       --log.level=info           Log filtering level.
+#       --log.format=logfmt        Log format to use. Possible options: logfmt or
+#                                  json.
+#       --tracing.config-file=<file-path>  
+#                                  Path to YAML file with tracing configuration.
+#                                  See format details:
+#                                  https://thanos.io/tracing.md/#configuration
+#       --tracing.config=<content>  
+#                                  Alternative to 'tracing.config-file' flag
+#                                  (lower priority). Content of YAML file with
+#                                  tracing configuration. See format details:
+#                                  https://thanos.io/tracing.md/#configuration
+#       --http-address="0.0.0.0:10902"  
+#                                  Listen host:port for HTTP endpoints.
+#       --http-grace-period=2m     Time to wait after an interrupt received for
+#                                  HTTP Server.
+#       --grpc-address="0.0.0.0:10901"  
+#                                  Listen ip:port address for gRPC endpoints
+#                                  (StoreAPI). Make sure this address is routable
+#                                  from other components.
+#       --grpc-grace-period=2m     Time to wait after an interrupt received for
+#                                  GRPC Server.
+#       --grpc-server-tls-cert=""  TLS Certificate for gRPC server, leave blank to
+#                                  disable TLS
+#       --grpc-server-tls-key=""   TLS Key for the gRPC server, leave blank to
+#                                  disable TLS
+#       --grpc-server-tls-client-ca=""  
+#                                  TLS CA to verify clients against. If no client
+#                                  CA is specified, there is no client
+#                                  verification on server side. (tls.NoClientCert)
+#       --data-dir="./data"        Data directory in which to cache remote blocks.
+#       --index-cache-size=250MB   Maximum size of items held in the in-memory
+#                                  index cache. Ignored if --index-cache.config or
+#                                  --index-cache.config-file option is specified.
+#       --index-cache.config-file=<file-path>  
+#                                  Path to YAML file that contains index cache
+#                                  configuration. See format details:
+#                                  https://thanos.io/components/store.md/#index-cache
+#       --index-cache.config=<content>  
+#                                  Alternative to 'index-cache.config-file' flag
+#                                  (lower priority). Content of YAML file that
+#                                  contains index cache configuration. See format
+#                                  details:
+#                                  https://thanos.io/components/store.md/#index-cache
+#       --chunk-pool-size=2GB      Maximum size of concurrently allocatable bytes
+#                                  reserved strictly to reuse for chunks in
+#                                  memory.
+#       --store.grpc.series-sample-limit=0  
+#                                  Maximum amount of samples returned via a single
+#                                  Series call. 0 means no limit. NOTE: For
+#                                  efficiency we take 120 as the number of samples
+#                                  in chunk (it cannot be bigger than that), so
+#                                  the actual number of samples might be lower,
+#                                  even though the maximum could be hit.
+#       --store.grpc.series-max-concurrency=20  
+#                                  Maximum number of concurrent Series calls.
+#       --objstore.config-file=<file-path>  
+#                                  Path to YAML file that contains object store
+#                                  configuration. See format details:
+#                                  https://thanos.io/storage.md/#configuration
+#       --objstore.config=<content>  
+#                                  Alternative to 'objstore.config-file' flag
+#                                  (lower priority). Content of YAML file that
+#                                  contains object store configuration. See format
+#                                  details:
+#                                  https://thanos.io/storage.md/#configuration
+#       --sync-block-duration=3m   Repeat interval for syncing the blocks between
+#                                  local and remote view.
+#       --block-sync-concurrency=20  
+#                                  Number of goroutines to use when constructing
+#                                  index-cache.json blocks from object storage.
+#       --min-time=0000-01-01T00:00:00Z  
+#                                  Start of time range limit to serve. Thanos
+#                                  Store will serve only metrics, which happened
+#                                  later than this value. Option can be a constant
+#                                  time in RFC3339 format or time duration
+#                                  relative to current time, such as -1d or 2h45m.
+#                                  Valid duration units are ms, s, m, h, d, w, y.
+#       --max-time=9999-12-31T23:59:59Z  
+#                                  End of time range limit to serve. Thanos Store
+#                                  will serve only blocks, which happened eariler
+#                                  than this value. Option can be a constant time
+#                                  in RFC3339 format or time duration relative to
+#                                  current time, such as -1d or 2h45m. Valid
+#                                  duration units are ms, s, m, h, d, w, y.
+#       --selector.relabel-config-file=<file-path>  
+#                                  Path to YAML file that contains relabeling
+#                                  configuration that allows selecting blocks. It
+#                                  follows native Prometheus relabel-config
+#                                  syntax. See format details:
+#                                  https://prometheus.io/docs/prometheus/latest/configuration/configuration/#relabel_config
+#       --selector.relabel-config=<content>  
+#                                  Alternative to 'selector.relabel-config-file'
+#                                  flag (lower priority). Content of YAML file
+#                                  that contains relabeling configuration that
+#                                  allows selecting blocks. It follows native
+#                                  Prometheus relabel-config syntax. See format
+#                                  details:
+#                                  https://prometheus.io/docs/prometheus/latest/configuration/configuration/#relabel_config
+#       --consistency-delay=0s     Minimum age of all blocks before they are being
+#                                  read. Set it to safe value (e.g 30m) if your
+#                                  object storage is eventually consistent. GCS
+#                                  and S3 are (roughly) strongly consistent.
+#       --ignore-deletion-marks-delay=24h  
+#                                  Duration after which the blocks marked for
+#                                  deletion will be filtered out while fetching
+#                                  blocks. The idea of ignore-deletion-marks-delay
+#                                  is to ignore blocks that are marked for
+#                                  deletion with some delay. This ensures store
+#                                  can still serve blocks that are meant to be
+#                                  deleted but do not have a replacement yet. If
+#                                  delete-delay duration is provided to compactor
+#                                  or bucket verify component, it will upload
+#                                  deletion-mark.json file to mark after what
+#                                  duration the block should be deleted rather
+#                                  than deleting the block straight away. If
+#                                  delete-delay is non-zero for compactor or
+#                                  bucket verify component,
+#                                  ignore-deletion-marks-delay should be set to
+#                                  (delete-delay)/2 so that blocks marked for
+#                                  deletion are filtered out while fetching blocks
+#                                  before being deleted from bucket. Default is
+#                                  24h, half of the default value for
+#                                  --delete-delay on compactor.
+# 
