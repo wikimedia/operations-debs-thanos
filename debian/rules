@@ -5,7 +5,7 @@
 #   ./thanos $c --help 2>&1 | sed 's@^@# @' > debian/thanos.thanos-${c}.default
 # done
 
-export HOME := $(shell mktemp -d /tmp/thanos-build.XXXXXX)
+export HOME := /tmp/thanos-build
 export GOPATH := $(HOME)/go
 export PATH := $(GOPATH)/bin:/usr/lib/go-1.12/bin:$(PATH)
 
@@ -20,6 +20,9 @@ export THANOS_SKIP_GCS_TESTS="true"
 
 override_dh_auto_build:
 	make -j4 build
+
+override_dh_auto_install:
+	install -v -m755 -D $(GOPATH)/bin/thanos $(CURDIR)/debian/thanos/usr/bin/thanos
 
 override_dh_auto_clean:
 	dh_auto_clean
