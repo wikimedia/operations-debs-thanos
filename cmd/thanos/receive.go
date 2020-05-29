@@ -6,7 +6,9 @@ package main
 import (
 	"context"
 	"fmt"
+	"io/ioutil"
 	"os"
+	"path"
 	"strings"
 	"time"
 
@@ -17,20 +19,20 @@ import (
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/prometheus/pkg/labels"
-	"github.com/prometheus/prometheus/storage/tsdb"
+	"github.com/prometheus/prometheus/tsdb"
 	kingpin "gopkg.in/alecthomas/kingpin.v2"
 
-	"github.com/thanos-io/thanos/pkg/block/metadata"
 	"github.com/thanos-io/thanos/pkg/component"
 	"github.com/thanos-io/thanos/pkg/extflag"
 	"github.com/thanos-io/thanos/pkg/extgrpc"
+	"github.com/thanos-io/thanos/pkg/extprom"
+	"github.com/thanos-io/thanos/pkg/objstore"
 	"github.com/thanos-io/thanos/pkg/objstore/client"
 	"github.com/thanos-io/thanos/pkg/prober"
 	"github.com/thanos-io/thanos/pkg/receive"
 	"github.com/thanos-io/thanos/pkg/runutil"
 	grpcserver "github.com/thanos-io/thanos/pkg/server/grpc"
 	httpserver "github.com/thanos-io/thanos/pkg/server/http"
-	"github.com/thanos-io/thanos/pkg/shipper"
 	"github.com/thanos-io/thanos/pkg/store"
 	"github.com/thanos-io/thanos/pkg/tls"
 )
@@ -71,9 +73,15 @@ func registerReceive(m map[string]setupFunc, app *kingpin.Application) {
 
 	tenantHeader := cmd.Flag("receive.tenant-header", "HTTP header to determine tenant for write requests.").Default(receive.DefaultTenantHeader).String()
 
+	defaultTenantID := cmd.Flag("receive.default-tenant-id", "Default tenant ID to use when none is provided via a header.").Default(receive.DefaultTenant).String()
+
+	tenantLabelName := cmd.Flag("receive.tenant-label-name", "Label name through which the tenant will be announced.").Default(receive.DefaultTenantLabel).String()
+
 	replicaHeader := cmd.Flag("receive.replica-header", "HTTP header specifying the replica number of a write request.").Default(receive.DefaultReplicaHeader).String()
 
 	replicationFactor := cmd.Flag("receive.replication-factor", "How many times to replicate incoming write requests.").Default("1").Uint64()
+
+	forwardTimeout := modelDuration(cmd.Flag("receive-forward-timeout", "Timeout for forward requests.").Default("5s").Hidden())
 
 	tsdbMinBlockDuration := modelDuration(cmd.Flag("tsdb.min-block-duration", "Min duration for local TSDB blocks").Default("2h").Hidden())
 	tsdbMaxBlockDuration := modelDuration(cmd.Flag("tsdb.max-block-duration", "Max duration for local TSDB blocks").Default("2h").Hidden())
@@ -96,9 +104,9 @@ func registerReceive(m map[string]setupFunc, app *kingpin.Application) {
 		}
 
 		tsdbOpts := &tsdb.Options{
-			MinBlockDuration:  *tsdbMinBlockDuration,
-			MaxBlockDuration:  *tsdbMaxBlockDuration,
-			RetentionDuration: *retention,
+			MinBlockDuration:  int64(time.Duration(*tsdbMinBlockDuration) / time.Millisecond),
+			MaxBlockDuration:  int64(time.Duration(*tsdbMaxBlockDuration) / time.Millisecond),
+			RetentionDuration: int64(time.Duration(*retention) / time.Millisecond),
 			NoLockfile:        true,
 			WALCompression:    *walCompression,
 		}
@@ -143,8 +151,11 @@ func registerReceive(m map[string]setupFunc, app *kingpin.Application) {
 			cw,
 			*local,
 			*tenantHeader,
+			*defaultTenantID,
+			*tenantLabelName,
 			*replicaHeader,
 			*replicationFactor,
+			time.Duration(*forwardTimeout),
 			comp,
 		)
 	}
@@ -178,19 +189,17 @@ func runReceive(
 	cw *receive.ConfigWatcher,
 	endpoint string,
 	tenantHeader string,
+	defaultTenantID string,
+	tenantLabelName string,
 	replicaHeader string,
 	replicationFactor uint64,
+	forwardTimeout time.Duration,
 	comp component.SourceStoreAPI,
 ) error {
 	logger = log.With(logger, "component", "receive")
 	level.Warn(logger).Log("msg", "setting up receive; the Thanos receive component is EXPERIMENTAL, it may break significantly without notice")
 
-	localStorage := &tsdb.ReadyStorage{}
 	rwTLSConfig, err := tls.NewServerConfig(log.With(logger, "protocol", "HTTP"), rwServerCert, rwServerKey, rwServerClientCA)
-	if err != nil {
-		return err
-	}
-	rwTLSClientConfig, err := tls.NewClientConfig(logger, rwClientCert, rwClientKey, rwClientServerCA, rwClientServerName)
 	if err != nil {
 		return err
 	}
@@ -199,17 +208,59 @@ func runReceive(
 		return err
 	}
 
+	var bkt objstore.Bucket
+	confContentYaml, err := objStoreConfig.Content()
+	if err != nil {
+		return err
+	}
+	upload := len(confContentYaml) > 0
+	if upload {
+		if tsdbOpts.MinBlockDuration != tsdbOpts.MaxBlockDuration {
+			if !ignoreBlockSize {
+				return errors.Errorf("found that TSDB Max time is %d and Min time is %d. "+
+					"Compaction needs to be disabled (tsdb.min-block-duration = tsdb.max-block-duration)", tsdbOpts.MaxBlockDuration, tsdbOpts.MinBlockDuration)
+			}
+			level.Warn(logger).Log("msg", "flag to ignore min/max block duration flags differing is being used. If the upload of a 2h block fails and a tsdb compaction happens that block may be missing from your Thanos bucket storage.")
+		}
+		// The background shipper continuously scans the data directory and uploads
+		// new blocks to object storage service.
+		bkt, err = client.NewBucket(logger, confContentYaml, reg, comp.String())
+		if err != nil {
+			return err
+		}
+	} else {
+		level.Info(logger).Log("msg", "no supported bucket was configured, uploads will be disabled")
+	}
+
+	// TODO(brancz): remove after a couple of versions
+	// Migrate non-multi-tsdb capable storage to multi-tsdb disk layout.
+	if err := migrateLegacyStorage(logger, dataDir, defaultTenantID); err != nil {
+		return errors.Wrapf(err, "migrate legacy storage in %v to default tenant %v", dataDir, defaultTenantID)
+	}
+
+	dbs := receive.NewMultiTSDB(
+		dataDir,
+		logger,
+		reg,
+		tsdbOpts,
+		lset,
+		tenantLabelName,
+		bkt,
+	)
+	writer := receive.NewWriter(log.With(logger, "component", "receive-writer"), dbs)
 	webHandler := receive.NewHandler(log.With(logger, "component", "receive-handler"), &receive.Options{
+		Writer:            writer,
 		ListenAddress:     rwAddress,
 		Registry:          reg,
 		Endpoint:          endpoint,
 		TenantHeader:      tenantHeader,
+		DefaultTenantID:   defaultTenantID,
 		ReplicaHeader:     replicaHeader,
 		ReplicationFactor: replicationFactor,
 		Tracer:            tracer,
 		TLSConfig:         rwTLSConfig,
-		TLSClientConfig:   rwTLSClientConfig,
 		DialOpts:          dialOpts,
+		ForwardTimeout:    forwardTimeout,
 	})
 
 	grpcProbe := prober.NewGRPC()
@@ -217,26 +268,8 @@ func runReceive(
 	statusProber := prober.Combine(
 		httpProbe,
 		grpcProbe,
-		prober.NewInstrumentation(comp, logger, prometheus.WrapRegistererWithPrefix("thanos_", reg)),
+		prober.NewInstrumentation(comp, logger, extprom.WrapRegistererWithPrefix("thanos_", reg)),
 	)
-
-	confContentYaml, err := objStoreConfig.Content()
-	if err != nil {
-		return err
-	}
-	upload := true
-	if len(confContentYaml) == 0 {
-		level.Info(logger).Log("msg", "No supported bucket was configured, uploads will be disabled")
-		upload = false
-	}
-
-	if upload && tsdbOpts.MinBlockDuration != tsdbOpts.MaxBlockDuration {
-		if !ignoreBlockSize {
-			return errors.Errorf("found that TSDB Max time is %s and Min time is %s. "+
-				"Compaction needs to be disabled (tsdb.min-block-duration = tsdb.max-block-duration)", tsdbOpts.MaxBlockDuration, tsdbOpts.MinBlockDuration)
-		}
-		level.Warn(logger).Log("msg", "flag to ignore min/max block duration flags differing is being used. If the upload of a 2h block fails and a tsdb compaction happens that block may be missing from your Thanos bucket storage.")
-	}
 
 	// Start all components while we wait for TSDB to open but only load
 	// initial config and mark ourselves as ready after it completed.
@@ -254,24 +287,13 @@ func runReceive(
 	{
 		// TSDB.
 		cancel := make(chan struct{})
-		startTimeMargin := int64(2 * time.Duration(tsdbOpts.MinBlockDuration).Seconds() * 1000)
 		g.Add(func() error {
 			defer close(dbReady)
 			defer close(uploadC)
 
-			// Before actually starting, we need to make sure the
-			// WAL is flushed. The WAL is flushed after the
-			// hashring is loaded.
-			db := receive.NewFlushableStorage(
-				dataDir,
-				log.With(logger, "component", "tsdb"),
-				reg,
-				tsdbOpts,
-			)
-
 			// Before quitting, ensure the WAL is flushed and the DB is closed.
 			defer func() {
-				if err := db.Flush(); err != nil {
+				if err := dbs.Flush(); err != nil {
 					level.Warn(logger).Log("err", err, "msg", "failed to flush storage")
 				}
 			}()
@@ -284,28 +306,27 @@ func runReceive(
 					if !ok {
 						return nil
 					}
-					if err := db.Flush(); err != nil {
+
+					level.Info(logger).Log("msg", "updating DB")
+
+					if err := dbs.Flush(); err != nil {
 						return errors.Wrap(err, "flushing storage")
 					}
-					if err := db.Open(); err != nil {
+					if err := dbs.Open(); err != nil {
 						return errors.Wrap(err, "opening storage")
 					}
 					if upload {
 						uploadC <- struct{}{}
 						<-uploadDone
 					}
-					level.Info(logger).Log("msg", "tsdb started")
-					localStorage.Set(db.Get(), startTimeMargin)
-					webHandler.SetWriter(receive.NewWriter(log.With(logger, "component", "receive-writer"), localStorage))
 					statusProber.Ready()
-					level.Info(logger).Log("msg", "server is ready to receive web requests.")
+					level.Info(logger).Log("msg", "tsdb started, and server is ready to receive web requests")
 					dbReady <- struct{}{}
 				}
 			}
 		}, func(err error) {
 			close(cancel)
-		},
-		)
+		})
 	}
 
 	level.Debug(logger).Log("msg", "setting up hashring")
@@ -315,11 +336,17 @@ func runReceive(
 		// In the single-node case, which has no configuration
 		// watcher, we close the chan ourselves.
 		updates := make(chan receive.Hashring, 1)
+
 		if cw != nil {
+			// Check the hashring configuration on before running the watcher.
+			if err := cw.ValidateConfig(); err != nil {
+				close(updates)
+				return errors.Wrap(err, "failed to validate hashring configuration file")
+			}
+
 			ctx, cancel := context.WithCancel(context.Background())
 			g.Add(func() error {
-				receive.HashringFromConfig(ctx, updates, cw)
-				return nil
+				return receive.HashringFromConfig(ctx, updates, cw)
 			}, func(error) {
 				cancel()
 			})
@@ -344,7 +371,6 @@ func runReceive(
 					if !ok {
 						return nil
 					}
-					webHandler.SetWriter(nil)
 					webHandler.Hashring(h)
 					msg := "hashring has changed; server is not ready to receive web requests."
 					statusProber.NotReady(errors.New(msg))
@@ -392,9 +418,14 @@ func runReceive(
 				if s != nil {
 					s.Shutdown(errors.New("reload hashrings"))
 				}
-				tsdbStore := store.NewTSDBStore(log.With(logger, "component", "thanos-tsdb-store"), nil, localStorage.Get(), comp, lset)
+
 				rw := store.ReadWriteTSDBStore{
-					StoreServer:          tsdbStore,
+					StoreServer: store.NewMultiTSDBStore(
+						logger,
+						reg,
+						comp,
+						dbs.TSDBStores,
+					),
 					WriteableStoreServer: webHandler,
 				}
 
@@ -405,17 +436,16 @@ func runReceive(
 				)
 				startGRPC <- struct{}{}
 			}
-			return nil
-		}, func(err error) {
 			if s != nil {
 				s.Shutdown(err)
 			}
-		})
+			return nil
+		}, func(error) {})
 		// We need to be able to start and stop the gRPC server
 		// whenever the DB changes, thus it needs its own run group.
 		g.Add(func() error {
 			for range startGRPC {
-				level.Info(logger).Log("msg", "listening for StoreAPI gRPC", "address", grpcBindAddr)
+				level.Info(logger).Log("msg", "listening for StoreAPI and WritableStoreAPI gRPC", "address", grpcBindAddr)
 				if err := s.ListenAndServe(); err != nil {
 					return errors.Wrap(err, "serve gRPC")
 				}
@@ -437,18 +467,9 @@ func runReceive(
 	}
 
 	if upload {
-		// The background shipper continuously scans the data directory and uploads
-		// new blocks to Google Cloud Storage or an S3-compatible storage service.
-		bkt, err := client.NewBucket(logger, confContentYaml, reg, comp.String())
-		if err != nil {
-			return err
-		}
-
-		s := shipper.New(logger, reg, dataDir, bkt, func() labels.Labels { return lset }, metadata.ReceiveSource)
-
-		// Before starting, ensure any old blocks are uploaded.
-		if uploaded, err := s.Sync(context.Background()); err != nil {
-			level.Warn(logger).Log("err", err, "failed to upload", uploaded)
+		level.Debug(logger).Log("msg", "upload enabled")
+		if err := dbs.Sync(context.Background()); err != nil {
+			level.Warn(logger).Log("msg", "initial upload failed", "err", err)
 		}
 
 		{
@@ -456,8 +477,8 @@ func runReceive(
 			ctx, cancel := context.WithCancel(context.Background())
 			g.Add(func() error {
 				return runutil.Repeat(30*time.Second, ctx.Done(), func() error {
-					if uploaded, err := s.Sync(ctx); err != nil {
-						level.Warn(logger).Log("err", err, "uploaded", uploaded)
+					if err := dbs.Sync(ctx); err != nil {
+						level.Warn(logger).Log("msg", "interval upload failed", "err", err)
 					}
 
 					return nil
@@ -478,8 +499,8 @@ func runReceive(
 				// Before quitting, ensure all blocks are uploaded.
 				defer func() {
 					<-uploadC
-					if uploaded, err := s.Sync(context.Background()); err != nil {
-						level.Warn(logger).Log("err", err, "failed to upload", uploaded)
+					if err := dbs.Sync(context.Background()); err != nil {
+						level.Warn(logger).Log("msg", "on demnad upload failed", "err", err)
 					}
 				}()
 				defer close(uploadDone)
@@ -493,8 +514,8 @@ func runReceive(
 					case <-ctx.Done():
 						return nil
 					case <-uploadC:
-						if uploaded, err := s.Sync(ctx); err != nil {
-							level.Warn(logger).Log("err", err, "failed to upload", uploaded)
+						if err := dbs.Sync(ctx); err != nil {
+							level.Warn(logger).Log("err", err)
 						}
 						uploadDone <- struct{}{}
 					}
@@ -506,5 +527,40 @@ func runReceive(
 	}
 
 	level.Info(logger).Log("msg", "starting receiver")
+	return nil
+}
+
+func migrateLegacyStorage(logger log.Logger, dataDir, defaultTenantID string) error {
+	defaultTenantDataDir := path.Join(dataDir, defaultTenantID)
+
+	if _, err := os.Stat(defaultTenantDataDir); !os.IsNotExist(err) {
+		level.Info(logger).Log("msg", "default tenant data dir already present, not attempting to migrate storage")
+		return nil
+	}
+
+	if _, err := os.Stat(dataDir); os.IsNotExist(err) {
+		level.Info(logger).Log("msg", "no existing storage found, no data migration attempted")
+		return nil
+	}
+
+	level.Info(logger).Log("msg", "found legacy storage, migrating to multi-tsdb layout with default tenant", "defaultTenantID", defaultTenantID)
+
+	files, err := ioutil.ReadDir(dataDir)
+	if err != nil {
+		return errors.Wrapf(err, "read legacy data dir: %v", dataDir)
+	}
+
+	if err := os.MkdirAll(defaultTenantDataDir, 0777); err != nil {
+		return errors.Wrapf(err, "create default tenant data dir: %v", defaultTenantDataDir)
+	}
+
+	for _, f := range files {
+		from := path.Join(dataDir, f.Name())
+		to := path.Join(defaultTenantDataDir, f.Name())
+		if err := os.Rename(from, to); err != nil {
+			return errors.Wrapf(err, "migrate file from %v to %v", from, to)
+		}
+	}
+
 	return nil
 }

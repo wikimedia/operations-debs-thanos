@@ -38,6 +38,7 @@ import (
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/pkg/timestamp"
 	"github.com/prometheus/prometheus/promql"
+	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/prometheus/prometheus/storage"
 	extpromhttp "github.com/thanos-io/thanos/pkg/extprom/http"
 	"github.com/thanos-io/thanos/pkg/query"
@@ -107,6 +108,7 @@ type API struct {
 	enablePartialResponse                  bool
 	replicaLabels                          []string
 	reg                                    prometheus.Registerer
+	storeSet                               *query.StoreSet
 	defaultInstantQueryMaxSourceResolution time.Duration
 
 	now func() time.Time
@@ -116,6 +118,7 @@ type API struct {
 func NewAPI(
 	logger log.Logger,
 	reg *prometheus.Registry,
+	storeSet *query.StoreSet,
 	qe *promql.Engine,
 	c query.QueryableCreator,
 	enableAutodownsampling bool,
@@ -131,6 +134,7 @@ func NewAPI(
 		enablePartialResponse:                  enablePartialResponse,
 		replicaLabels:                          replicaLabels,
 		reg:                                    reg,
+		storeSet:                               storeSet,
 		defaultInstantQueryMaxSourceResolution: defaultInstantQueryMaxSourceResolution,
 
 		now: time.Now,
@@ -168,11 +172,13 @@ func (api *API) Register(r *route.Router, tracer opentracing.Tracer, logger log.
 
 	r.Get("/labels", instr("label_names", api.labelNames))
 	r.Post("/labels", instr("label_names", api.labelNames))
+
+	r.Get("/stores", instr("stores", api.stores))
 }
 
 type queryData struct {
-	ResultType promql.ValueType `json:"resultType"`
-	Result     promql.Value     `json:"result"`
+	ResultType parser.ValueType `json:"resultType"`
+	Result     parser.Value     `json:"result"`
 
 	// Additional Thanos Response field.
 	Warnings []error `json:"warnings,omitempty"`
@@ -347,7 +353,7 @@ func (api *API) queryRange(r *http.Request) (interface{}, []error, *ApiError) {
 	// For safety, limit the number of returned points per timeseries.
 	// This is sufficient for 60s resolution for a week or 1h resolution for a year.
 	if end.Sub(start)/step > 11000 {
-		err := errors.Errorf("exceeded maximum resolution of 11,000 points per timeseries. Try decreasing the query resolution (?step=XX)")
+		err := errors.New("exceeded maximum resolution of 11,000 points per timeseries. Try decreasing the query resolution (?step=XX)")
 		return nil, nil, &ApiError{errorBadData, err}
 	}
 
@@ -421,7 +427,7 @@ func (api *API) labelValues(r *http.Request) (interface{}, []error, *ApiError) {
 	name := route.Param(ctx, "name")
 
 	if !model.LabelNameRE.MatchString(name) {
-		return nil, nil, &ApiError{errorBadData, fmt.Errorf("invalid label name: %q", name)}
+		return nil, nil, &ApiError{errorBadData, errors.Errorf("invalid label name: %q", name)}
 	}
 
 	enablePartialResponse, apiErr := api.parsePartialResponseParam(r)
@@ -456,7 +462,7 @@ func (api *API) series(r *http.Request) (interface{}, []error, *ApiError) {
 	}
 
 	if len(r.Form["match[]"]) == 0 {
-		return nil, nil, &ApiError{errorBadData, fmt.Errorf("no match[] parameter provided")}
+		return nil, nil, &ApiError{errorBadData, errors.New("no match[] parameter provided")}
 	}
 
 	var start time.Time
@@ -483,7 +489,7 @@ func (api *API) series(r *http.Request) (interface{}, []error, *ApiError) {
 
 	var matcherSets [][]*labels.Matcher
 	for _, s := range r.Form["match[]"] {
-		matchers, err := promql.ParseMetricSelector(s)
+		matchers, err := parser.ParseMetricSelector(s)
 		if err != nil {
 			return nil, nil, &ApiError{errorBadData, err}
 		}
@@ -518,7 +524,7 @@ func (api *API) series(r *http.Request) (interface{}, []error, *ApiError) {
 		sets     []storage.SeriesSet
 	)
 	for _, mset := range matcherSets {
-		s, warns, err := q.Select(nil, mset...)
+		s, warns, err := q.Select(false, nil, mset...)
 		if err != nil {
 			return nil, nil, &ApiError{errorExec, err}
 		}
@@ -526,7 +532,7 @@ func (api *API) series(r *http.Request) (interface{}, []error, *ApiError) {
 		sets = append(sets, s)
 	}
 
-	set := storage.NewMergeSeriesSet(sets, nil)
+	set := storage.NewMergeSeriesSet(sets, storage.ChainedSeriesMerge)
 	for set.Next() {
 		metrics = append(metrics, set.At().Labels())
 	}
@@ -588,21 +594,21 @@ func parseTime(s string) (time.Time, error) {
 	if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
 		return t, nil
 	}
-	return time.Time{}, fmt.Errorf("cannot parse %q to a valid timestamp", s)
+	return time.Time{}, errors.Errorf("cannot parse %q to a valid timestamp", s)
 }
 
 func parseDuration(s string) (time.Duration, error) {
 	if d, err := strconv.ParseFloat(s, 64); err == nil {
 		ts := d * float64(time.Second)
 		if ts > float64(math.MaxInt64) || ts < float64(math.MinInt64) {
-			return 0, fmt.Errorf("cannot parse %q to a valid duration. It overflows int64", s)
+			return 0, errors.Errorf("cannot parse %q to a valid duration. It overflows int64", s)
 		}
 		return time.Duration(ts), nil
 	}
 	if d, err := model.ParseDuration(s); err == nil {
 		return time.Duration(d), nil
 	}
-	return 0, fmt.Errorf("cannot parse %q to a valid duration", s)
+	return 0, errors.Errorf("cannot parse %q to a valid duration", s)
 }
 
 func (api *API) labelNames(r *http.Request) (interface{}, []error, *ApiError) {
@@ -625,4 +631,12 @@ func (api *API) labelNames(r *http.Request) (interface{}, []error, *ApiError) {
 	}
 
 	return names, warnings, nil
+}
+
+func (api *API) stores(r *http.Request) (interface{}, []error, *ApiError) {
+	statuses := make(map[string][]query.StoreStatus)
+	for _, status := range api.storeSet.GetStoreStatus() {
+		statuses[status.StoreType.String()] = append(statuses[status.StoreType.String()], status)
+	}
+	return statuses, nil, nil
 }

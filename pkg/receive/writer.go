@@ -9,11 +9,12 @@ import (
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
 	"github.com/pkg/errors"
-	"github.com/prometheus/prometheus/prompb"
-
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/storage"
+	"github.com/prometheus/prometheus/tsdb"
 	terrors "github.com/prometheus/prometheus/tsdb/errors"
+
+	"github.com/thanos-io/thanos/pkg/store/storepb/prompb"
 )
 
 // Appendable returns an Appender.
@@ -21,26 +22,38 @@ type Appendable interface {
 	Appender() (storage.Appender, error)
 }
 
-type Writer struct {
-	logger log.Logger
-	append Appendable
+type TenantStorage interface {
+	TenantAppendable(string) (Appendable, error)
 }
 
-func NewWriter(logger log.Logger, app Appendable) *Writer {
+type Writer struct {
+	logger    log.Logger
+	multiTSDB TenantStorage
+}
+
+func NewWriter(logger log.Logger, multiTSDB TenantStorage) *Writer {
 	return &Writer{
-		logger: logger,
-		append: app,
+		logger:    logger,
+		multiTSDB: multiTSDB,
 	}
 }
 
-func (r *Writer) Write(wreq *prompb.WriteRequest) error {
+func (r *Writer) Write(tenantID string, wreq *prompb.WriteRequest) error {
 	var (
 		numOutOfOrder  = 0
 		numDuplicates  = 0
 		numOutOfBounds = 0
 	)
 
-	app, err := r.append.Appender()
+	s, err := r.multiTSDB.TenantAppendable(tenantID)
+	if err != nil {
+		return errors.Wrap(err, "get tenant appendable")
+	}
+
+	app, err := s.Appender()
+	if err == tsdb.ErrNotReady {
+		return err
+	}
 	if err != nil {
 		return errors.Wrap(err, "get appender")
 	}
@@ -94,6 +107,18 @@ func (r *Writer) Write(wreq *prompb.WriteRequest) error {
 	return errs.Err()
 }
 
+type fakeTenantAppendable struct {
+	f *fakeAppendable
+}
+
+func newFakeTenantAppendable(f *fakeAppendable) *fakeTenantAppendable {
+	return &fakeTenantAppendable{f: f}
+}
+
+func (t *fakeTenantAppendable) TenantAppendable(tenantID string) (Appendable, error) {
+	return t.f, nil
+}
+
 type fakeAppendable struct {
 	appender    storage.Appender
 	appenderErr func() error
@@ -115,7 +140,7 @@ func (f *fakeAppendable) Appender() (storage.Appender, error) {
 
 type fakeAppender struct {
 	sync.Mutex
-	samples     map[string][]prompb.Sample
+	samples     map[uint64][]prompb.Sample
 	addErr      func() error
 	addFastErr  func() error
 	commitErr   func() error
@@ -138,7 +163,7 @@ func newFakeAppender(addErr, addFastErr, commitErr, rollbackErr func() error) *f
 		rollbackErr = nilErrFn
 	}
 	return &fakeAppender{
-		samples:     make(map[string][]prompb.Sample),
+		samples:     make(map[uint64][]prompb.Sample),
 		addErr:      addErr,
 		addFastErr:  addFastErr,
 		commitErr:   commitErr,
@@ -146,17 +171,27 @@ func newFakeAppender(addErr, addFastErr, commitErr, rollbackErr func() error) *f
 	}
 }
 
+func (f *fakeAppender) Get(l labels.Labels) []prompb.Sample {
+	f.Lock()
+	defer f.Unlock()
+	s := f.samples[l.Hash()]
+	res := make([]prompb.Sample, len(s))
+	copy(res, s)
+	return res
+}
+
 func (f *fakeAppender) Add(l labels.Labels, t int64, v float64) (uint64, error) {
 	f.Lock()
 	defer f.Unlock()
-	f.samples[l.String()] = append(f.samples[l.String()], prompb.Sample{Value: v, Timestamp: t})
-	return 0, f.addErr()
+	ref := l.Hash()
+	f.samples[ref] = append(f.samples[ref], prompb.Sample{Value: v, Timestamp: t})
+	return ref, f.addErr()
 }
 
-func (f *fakeAppender) AddFast(l labels.Labels, ref uint64, t int64, v float64) error {
+func (f *fakeAppender) AddFast(ref uint64, t int64, v float64) error {
 	f.Lock()
 	defer f.Unlock()
-	f.samples[l.String()] = append(f.samples[l.String()], prompb.Sample{Value: v, Timestamp: t})
+	f.samples[ref] = append(f.samples[ref], prompb.Sample{Value: v, Timestamp: t})
 	return f.addFastErr()
 }
 

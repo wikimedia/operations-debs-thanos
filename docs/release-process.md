@@ -32,7 +32,9 @@ Release shepherd responsibilities:
 
 | Release   | Time of first RC         | Shepherd (GitHub handle) |
 |-----------|--------------------------|--------------------------|
-| v0.12.0   | (planned) 2020.04.01     | TBD                      |
+| v0.14.0   | (planned) 2020.06.24     | TBA                      |
+| v0.13.0   | (planned) 2020.05.13     | `@bwplotka`              |
+| v0.12.0   | 2020.04.15               | `@squat`                 |
 | v0.11.0   | 2020.02.19               | `@metalmatze`            |
 | v0.10.0   | 2020.01.08               | `@GiedriusS`             |
 | v0.9.0    | 2019.11.26               | `@bwplotka`              |
@@ -55,7 +57,15 @@ Release is happening on separate `release-<major>.<minor>` branch.
 
 1. Prepare PR to branch `release-<major>.<minor>` that will start minor release branch and prepare changes to cut release.
 
+    Push the created branch to origin (Thanos repository) to be able to make your PR with the CHANGELOG.md changes against this branch later.
+
+    ```bash
+    $ git push origin release-<major>.<minor>
+    ```
+
   For release candidate just reuse same branch and rebase it on every candidate until the actual release happens.
+
+1. Create small PR to master (!) to cut CHANGELOG. This helps to maintain new changelog on master. For example: https://github.com/thanos-io/thanos/pull/2627
 
 1. Update [CHANGELOG file](/CHANGELOG.md)
 
@@ -66,14 +76,17 @@ Release is happening on separate `release-<major>.<minor>` branch.
   what have changed between release candidates.
 
 1. Double check backward compatibility:
+
     1. *In case of version after `v1+.y.z`*, double check if none of the changes break API compatibility. This should be done in PR review process, but double check is good to have.
     1. In case of `v0.y.z`, document all incompatibilities in changelog.
 
 1. Double check metric changes:
+
     1. Note any changes in the changelog
     1. If there were any changes then update the relevant alerting rules and/or dashboards since `thanos-mixin` is part of the repository now
 
 1. Update tutorials:
+
     1. Update the Thanos version used in the [tutorials](../tutorials) manifests.
     1. In case of any breaking changes or necessary updates adjust the manifests
        so the tutorial stays up to date.
@@ -82,9 +95,9 @@ Release is happening on separate `release-<major>.<minor>` branch.
 1. After review, merge the PR and immediately after this tag a version:
 
     ```bash
-    $ tag=x.y.z
-    $ git tag -s "v${tag}" -m "v${tag}"
-    $ git push origin "v${tag}"
+    tag=$(cat VERSION)
+    git tag -s "v${tag}" -m "v${tag}"
+    git push origin "v${tag}"
     ```
 
     Signing a tag with a GPG key is appreciated, but in case you can't add a GPG key to your Github account using the following [procedure](https://help.github.com/articles/generating-a-gpg-key/), you can replace the `-s` flag by `-a` flag of the `git tag` command to only annotate the tag without signing.

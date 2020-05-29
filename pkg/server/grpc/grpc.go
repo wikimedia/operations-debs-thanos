@@ -17,6 +17,7 @@ import (
 	"github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/thanos-io/thanos/pkg/component"
 	"github.com/thanos-io/thanos/pkg/prober"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
@@ -41,7 +42,9 @@ type Server struct {
 
 // New creates a new Server.
 func New(logger log.Logger, reg prometheus.Registerer, tracer opentracing.Tracer, comp component.Component, probe *prober.GRPCProbe, storeSrv storepb.StoreServer, opts ...Option) *Server {
-	options := options{}
+	options := options{
+		network: "tcp",
+	}
 	for _, o := range opts {
 		o.apply(&options)
 	}
@@ -50,11 +53,10 @@ func New(logger log.Logger, reg prometheus.Registerer, tracer opentracing.Tracer
 	met.EnableHandlingTimeHistogram(
 		grpc_prometheus.WithHistogramBuckets([]float64{0.001, 0.01, 0.1, 0.3, 0.6, 1, 3, 6, 9, 20, 30, 60, 90, 120}),
 	)
-	panicsTotal := prometheus.NewCounter(prometheus.CounterOpts{
+	panicsTotal := promauto.With(reg).NewCounter(prometheus.CounterOpts{
 		Name: "thanos_grpc_req_panics_recovered_total",
 		Help: "Total number of gRPC requests recovered from internal panic.",
 	})
-	reg.MustRegister(met, panicsTotal)
 
 	grpcPanicRecoveryHandler := func(p interface{}) (err error) {
 		panicsTotal.Inc()
@@ -83,6 +85,7 @@ func New(logger log.Logger, reg prometheus.Registerer, tracer opentracing.Tracer
 
 	storepb.RegisterStoreServer(s, storeSrv)
 	met.InitializeMetrics(s)
+	reg.MustRegister(met)
 
 	grpc_health.RegisterHealthServer(s, probe.HealthServer())
 
@@ -96,13 +99,13 @@ func New(logger log.Logger, reg prometheus.Registerer, tracer opentracing.Tracer
 
 // ListenAndServe listens on the TCP network address and handles requests on incoming connections.
 func (s *Server) ListenAndServe() error {
-	l, err := net.Listen("tcp", s.opts.listen)
+	l, err := net.Listen(s.opts.network, s.opts.listen)
 	if err != nil {
 		return errors.Wrapf(err, "listen gRPC on address %s", s.opts.listen)
 	}
 	s.listener = l
 
-	level.Info(s.logger).Log("msg", "listening for StoreAPI gRPC", "address", s.opts.listen)
+	level.Info(s.logger).Log("msg", "listening for serving gRPC", "address", s.opts.listen)
 	return errors.Wrap(s.srv.Serve(s.listener), "serve gRPC")
 }
 

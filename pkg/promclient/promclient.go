@@ -32,6 +32,7 @@ import (
 	promlabels "github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/pkg/textparse"
 	"github.com/prometheus/prometheus/promql"
+	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/thanos-io/thanos/pkg/runutil"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
 	"github.com/thanos-io/thanos/pkg/tracing"
@@ -349,6 +350,11 @@ func (c *Client) QueryInstant(ctx context.Context, base *url.URL, query string, 
 	}
 	defer runutil.ExhaustCloseWithLogOnErr(c.logger, resp.Body, "query body")
 
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "read query instant response")
+	}
+
 	// Decode only ResultType and load Result only as RawJson since we don't know
 	// structure of the Result yet.
 	var m struct {
@@ -363,11 +369,6 @@ func (c *Client) QueryInstant(ctx context.Context, base *url.URL, query string, 
 		Warnings []string `json:"warnings"`
 	}
 
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return nil, nil, errors.Wrap(err, "read query instant response")
-	}
-
 	if err = json.Unmarshal(body, &m); err != nil {
 		return nil, nil, errors.Wrap(err, "unmarshal query instant response")
 	}
@@ -377,11 +378,11 @@ func (c *Client) QueryInstant(ctx context.Context, base *url.URL, query string, 
 	// Decode the Result depending on the ResultType
 	// Currently only `vector` and `scalar` types are supported.
 	switch m.Data.ResultType {
-	case promql.ValueTypeVector:
+	case parser.ValueTypeVector:
 		if err = json.Unmarshal(m.Data.Result, &vectorResult); err != nil {
 			return nil, nil, errors.Wrap(err, "decode result into ValueTypeVector")
 		}
-	case promql.ValueTypeScalar:
+	case parser.ValueTypeScalar:
 		vectorResult, err = convertScalarJSONToVector(m.Data.Result)
 		if err != nil {
 			return nil, nil, errors.Wrap(err, "decode result into ValueTypeScalar")

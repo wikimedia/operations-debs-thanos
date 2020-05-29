@@ -1,4 +1,3 @@
-PREFIX            ?= $(shell pwd)
 FILES_TO_FMT      ?= $(shell find . -path ./vendor -prune -o -name '*.go' -print)
 
 DOCKER_IMAGE_REPO ?= quay.io/thanos/thanos
@@ -11,10 +10,16 @@ GOPATH            ?= $(shell go env GOPATH)
 
 TMP_GOPATH        ?= /tmp/thanos-go
 GOBIN             ?= $(firstword $(subst :, ,${GOPATH}))/bin
+
+# Promu is using this exact variable name, do not rename.
+PREFIX  ?= $(GOBIN)
+
 GO111MODULE       ?= on
 export GO111MODULE
 GOPROXY           ?= https://proxy.golang.org
 export GOPROXY
+
+GOTEST_OPTS ?= -failfast -timeout 10m -v
 
 # Tools.
 EMBEDMD           ?= $(GOBIN)/embedmd-$(EMBEDMD_VERSION)
@@ -44,8 +49,9 @@ MISSPELL             ?= $(GOBIN)/misspell-$(MISSPELL_VERSION)
 GOJSONTOYAML_VERSION    ?= e8bd32d46b3d764bef60f12b3bada1c132c4be55
 GOJSONTOYAML            ?= $(GOBIN)/gojsontoyaml-$(GOJSONTOYAML_VERSION)
 # v0.14.0
-JSONNET_VERSION         ?= fbde25be2182caa4345b03f1532450911ac7d1f3
+JSONNET_VERSION         ?= 724650d358b67909a7bea00ea443e23afc3d2a17
 JSONNET                 ?= $(GOBIN)/jsonnet-$(JSONNET_VERSION)
+JSONNETFMT              ?= $(GOBIN)/jsonnetfmt-$(JSONNET_VERSION)
 JSONNET_BUNDLER_VERSION ?= efe0c9e864431e93d5c3376bd5931d0fb9b2a296
 JSONNET_BUNDLER         ?= $(GOBIN)/jb-$(JSONNET_BUNDLER_VERSION)
 # Prometheus v2.14.0
@@ -56,8 +62,7 @@ PROMTOOL                ?= $(GOBIN)/promtool-$(PROMTOOL_VERSION)
 # systems gsed won't be installed, so will use sed as expected.
 SED ?= $(shell which gsed 2>/dev/null || which sed)
 
-MIXIN_ROOT              ?= mixin
-THANOS_MIXIN            ?= mixin/thanos
+THANOS_MIXIN            ?= mixin
 JSONNET_VENDOR_DIR      ?= mixin/vendor
 
 WEB_DIR           ?= website
@@ -78,6 +83,14 @@ ALERTMANAGER            ?= $(GOBIN)/alertmanager-$(ALERTMANAGER_VERSION)
 MINIO_SERVER_VERSION    ?= RELEASE.2018-10-06T00-15-16Z
 MINIO_SERVER            ?=$(GOBIN)/minio-$(MINIO_SERVER_VERSION)
 
+FAILLINT_VERSION        ?= v1.2.0
+FAILLINT                ?=$(GOBIN)/faillint-$(FAILLINT_VERSION)
+
+REACT_APP_PATH = pkg/ui/react-app
+REACT_APP_SOURCE_FILES = $(wildcard $(REACT_APP_PATH)/public/* $(REACT_APP_PATH)/src/* $(REACT_APP_PATH)/tsconfig.json)
+REACT_APP_OUTPUT_DIR = pkg/ui/static/react
+REACT_APP_NODE_MODULES_PATH = $(REACT_APP_PATH)/node_modules
+
 # fetch_go_bin_version downloads (go gets) the binary from specific version and installs it in $(GOBIN)/<bin>-<version>
 # arguments:
 # $(1): Install path. (e.g github.com/campoy/embedmd)
@@ -89,9 +102,9 @@ define fetch_go_bin_version
 
 	@echo ">> fetching $(1)@$(2) revision/version"
 	@if [ ! -d '$(TMP_GOPATH)/src/$(1)' ]; then \
-    GOPATH='$(TMP_GOPATH)' GO111MODULE='off' go get -d -u '$(1)/...'; \
+	GOPATH='$(TMP_GOPATH)' GO111MODULE='off' go get -d -u '$(1)/...'; \
   else \
-    CDPATH='' cd -- '$(TMP_GOPATH)/src/$(1)' && git fetch; \
+	CDPATH='' cd -- '$(TMP_GOPATH)/src/$(1)' && git fetch; \
   fi
 	@CDPATH='' cd -- '$(TMP_GOPATH)/src/$(1)' && git checkout -f -q '$(2)'
 	@echo ">> installing $(1)@$(2)"
@@ -104,108 +117,133 @@ endef
 define require_clean_work_tree
 	@git update-index -q --ignore-submodules --refresh
 
-    @if ! git diff-files --quiet --ignore-submodules --; then \
-        echo >&2 "cannot $1: you have unstaged changes."; \
-        git diff-files --name-status -r --ignore-submodules -- >&2; \
-        echo >&2 "Please commit or stash them."; \
-        exit 1; \
-    fi
+	@if ! git diff-files --quiet --ignore-submodules --; then \
+		echo >&2 "cannot $1: you have unstaged changes."; \
+		git diff-files --name-status -r --ignore-submodules -- >&2; \
+		echo >&2 "Please commit or stash them."; \
+		exit 1; \
+	fi
 
-    @if ! git diff-index --cached --quiet HEAD --ignore-submodules --; then \
-        echo >&2 "cannot $1: your index contains uncommitted changes."; \
-        git diff-index --cached --name-status -r --ignore-submodules HEAD -- >&2; \
-        echo >&2 "Please commit or stash them."; \
-        exit 1; \
-    fi
+	@if ! git diff-index --cached --quiet HEAD --ignore-submodules --; then \
+		echo >&2 "cannot $1: your index contains uncommitted changes."; \
+		git diff-index --cached --name-status -r --ignore-submodules HEAD -- >&2; \
+		echo >&2 "Please commit or stash them."; \
+		exit 1; \
+	fi
 
 endef
+
+help: ## Displays help.
+	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n\nTargets:\n"} /^[a-z0-9A-Z_-]+:.*?##/ { printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
 
 .PHONY: all
 all: format build
 
-# assets repacks all static assets into go file for easier deploy.
+$(REACT_APP_NODE_MODULES_PATH): $(REACT_APP_PATH)/package.json $(REACT_APP_PATH)/yarn.lock
+	   cd $(REACT_APP_PATH) && yarn --frozen-lockfile
+
+$(REACT_APP_OUTPUT_DIR): $(REACT_APP_NODE_MODULES_PATH) $(REACT_APP_SOURCE_FILES)
+	   @echo ">> building React app"
+	   @./scripts/build-react-app.sh
+
 .PHONY: assets
-assets: $(GOBINDATA)
+assets: # Repacks all static assets into go file for easier deploy.
+assets: $(GOBINDATA) $(REACT_APP_OUTPUT_DIR)
 	@echo ">> deleting asset file"
 	@rm pkg/ui/bindata.go || true
 	@echo ">> writing assets"
 	@$(GOBINDATA) $(bindata_flags) -pkg ui -o pkg/ui/bindata.go -ignore '(.*\.map|bootstrap\.js|bootstrap-theme\.css|bootstrap\.css)'  pkg/ui/templates/... pkg/ui/static/...
 	@go fmt ./pkg/ui
 
+.PHONY: react-app-lint
+react-app-lint: $(REACT_APP_NODE_MODULES_PATH)
+	   @echo ">> running React app linting"
+	   cd $(REACT_APP_PATH) && yarn lint:ci
 
-# build builds Thanos binary using `promu`.
+.PHONY: react-app-lint-fix
+react-app-lint-fix:
+	@echo ">> running React app linting and fixing errors where possible"
+	cd $(REACT_APP_PATH) && yarn lint
+
+.PHONY: react-app-test
+react-app-test: | $(REACT_APP_NODE_MODULES_PATH) react-app-lint
+	@echo ">> running React app tests"
+	cd $(REACT_APP_PATH) && export CI=true && yarn test --no-watch
+
+.PHONY: react-app-start
+react-app-start: $(REACT_APP_NODE_MODULES_PATH)
+	@echo ">> running React app"
+	cd $(REACT_APP_PATH) && yarn start
+
 .PHONY: build
+build: ## Builds Thanos binary using `promu`.
 build: check-git deps $(PROMU)
-	@echo ">> building binaries $(GOBIN)"
+	@echo ">> building Thanos binary in $(PREFIX)"
 	@$(PROMU) build --prefix $(PREFIX)
 
-# crossbuild builds all binaries for all platforms.
 .PHONY: crossbuild
+crossbuild: ## Builds all binaries for all platforms.
 crossbuild: $(PROMU)
 	@echo ">> crossbuilding all binaries"
 	$(PROMU) crossbuild -v
 
-# deps ensures fresh go.mod and go.sum.
 .PHONY: deps
-deps:
+deps: ## Ensures fresh go.mod and go.sum.
 	@go mod tidy
 	@go mod verify
 
-# docker builds docker with no tag.
 .PHONY: docker
+docker: ## Builds 'thanos' docker with no tag.
 docker: build
+	@echo ">> copying Thanos from $(PREFIX) to ./thanos_tmp_for_docker"
+	@cp $(PREFIX)/thanos ./thanos_tmp_for_docker
 	@echo ">> building docker image 'thanos'"
 	@docker build -t "thanos" .
+	@rm ./thanos_tmp_for_docker
 
-#docker-multi-stage builds docker image using multi-stage.
 .PHONY: docker-multi-stage
+docker-multi-stage: ## Builds 'thanos' docker image using multi-stage.
 docker-multi-stage:
 	@echo ">> building docker image 'thanos' with Dockerfile.multi-stage"
 	@docker build -f Dockerfile.multi-stage -t "thanos" .
 
-# docker-push pushes docker image build under `thanos` to "$(DOCKER_IMAGE_REPO):$(DOCKER_IMAGE_TAG)"
 .PHONY: docker-push
+docker-push: ## Pushes 'thanos' docker image build to "$(DOCKER_IMAGE_REPO):$(DOCKER_IMAGE_TAG)".
 docker-push:
 	@echo ">> pushing image"
 	@docker tag "thanos" "$(DOCKER_IMAGE_REPO):$(DOCKER_IMAGE_TAG)"
 	@docker push "$(DOCKER_IMAGE_REPO):$(DOCKER_IMAGE_TAG)"
 
-# docs regenerates flags in docs for all thanos commands.
 .PHONY: docs
+docs: ## Regenerates flags in docs for all thanos commands.
 docs: $(EMBEDMD) build
-	@EMBEDMD_BIN="$(EMBEDMD)" SED_BIN="$(SED)" scripts/genflagdocs.sh
+	@EMBEDMD_BIN="$(EMBEDMD)" SED_BIN="$(SED)" THANOS_BIN="$(GOBIN)/thanos"  scripts/genflagdocs.sh
 	@find . -type f -name "*.md" | SED_BIN="$(SED)" xargs scripts/cleanup-white-noise.sh
 
-# check-docs checks:
-# - discrepancy with flags is valid
-# - links are valid
-# - white noise
 .PHONY: check-docs
+check-docs: ## checks docs against discrepancy with flags, links, white noise.
 check-docs: $(EMBEDMD) $(LICHE) build
-	@EMBEDMD_BIN="$(EMBEDMD)" SED_BIN="$(SED)" scripts/genflagdocs.sh check
-	@$(LICHE) --recursive docs --exclude "(couchdb.apache.org/bylaws.html|cloud.tencent.com|alibabacloud.com)" --document-root .
+	@EMBEDMD_BIN="$(EMBEDMD)" SED_BIN="$(SED)" THANOS_BIN="$(GOBIN)/thanos" scripts/genflagdocs.sh check
+	@$(LICHE) --recursive docs --exclude "(couchdb.apache.org/bylaws.html|cloud.tencent.com|alibabacloud.com|zoom.us)" --document-root .
 	@$(LICHE) --exclude "goreportcard.com" --document-root . *.md
 	@find . -type f -name "*.md" | SED_BIN="$(SED)" xargs scripts/cleanup-white-noise.sh
 	$(call require_clean_work_tree,"check documentation")
 
-# checks Go code comments if they have trailing period (excludes protobuffers and vendor files).
-# Comments with more than 3 spaces at beginning are omitted from the check, example: '//    - foo'.
 .PHONY: check-comments
-check-comments:
+check-comments: ## Checks Go code comments if they have trailing period (excludes protobuffers and vendor files). Comments with more than 3 spaces at beginning are omitted from the check, example: '//    - foo'.
 	@printf ">> checking Go comments trailing periods\n\n\n"
 	@./scripts/build-check-comments.sh
 
-# format the code:
-# - format code (including imports format)
-# - clean up all white noise
 .PHONY: format
+format: ## Formats Go code including imports and cleans up white noise.
 format: $(GOIMPORTS) check-comments
 	@echo ">> formatting code"
+	@gofmt -s -w $(FILES_TO_FMT)
 	@$(GOIMPORTS) -w $(FILES_TO_FMT)
 	@SED_BIN="$(SED)" scripts/cleanup-white-noise.sh $(FILES_TO_FMT)
 
-# proto generates golang files from Thanos proto files.
 .PHONY: proto
+proto: ## Generates Go files from Thanos proto files.
 proto: check-git  $(GOIMPORTS) $(PROTOC)
 	@GOIMPORTS_BIN="$(GOIMPORTS)" PROTOC_BIN="$(PROTOC)" scripts/genproto.sh
 
@@ -213,46 +251,56 @@ proto: check-git  $(GOIMPORTS) $(PROTOC)
 promu: $(PROMU)
 
 .PHONY: tarballs-release
+tarballs-release: ## Build tarballs.
 tarballs-release: $(PROMU)
 	@echo ">> Publishing tarballs"
 	$(PROMU) crossbuild -v tarballs
 	$(PROMU) checksum -v .tarballs
 	$(PROMU) release -v .tarballs
 
-# test runs all Thanos golang tests against each supported version of Prometheus.
 .PHONY: test
+test: ## Runs all Thanos Go unit tests against each supported version of Prometheus. This excludes tests in ./test/e2e.
 test: export GOCACHE= $(TMP_GOPATH)/gocache
 test: export THANOS_TEST_MINIO_PATH= $(MINIO_SERVER)
 test: export THANOS_TEST_PROMETHEUS_VERSIONS= $(PROM_VERSIONS)
 test: export THANOS_TEST_ALERTMANAGER_PATH= $(ALERTMANAGER)
 test: check-git install-deps
 	@echo ">> install thanos GOOPTS=${GOOPTS}"
-	# Thanos binary is required by e2e tests.
-	@go install github.com/thanos-io/thanos/cmd/thanos
-	# Be careful on GOCACHE. Those tests are sometimes using built Thanos/Prometheus binaries directly. Don't cache those.
-	@rm -rf ${GOCACHE}
-	@echo ">> running all tests. Do export THANOS_TEST_OBJSTORE_SKIP=GCS,S3,AZURE,SWIFT,COS,ALIYUNOSS if you want to skip e2e tests against all real store buckets. Current value: ${THANOS_TEST_OBJSTORE_SKIP}"
-	@go test $(shell go list ./... | grep -v /vendor/);
+	@echo ">> running unit tests (without /test/e2e). Do export THANOS_TEST_OBJSTORE_SKIP=GCS,S3,AZURE,SWIFT,COS,ALIYUNOSS if you want to skip e2e tests against all real store buckets. Current value: ${THANOS_TEST_OBJSTORE_SKIP}"
+	@go test $(shell go list ./... | grep -v /vendor/ | grep -v /test/e2e);
 
 .PHONY: test-ci
+test-ci: ## Runs test for CI, so excluding object storage integrations that we don't have configured yet.
 test-ci: export THANOS_TEST_OBJSTORE_SKIP=AZURE,SWIFT,COS,ALIYUNOSS
 test-ci:
 	@echo ">> Skipping ${THANOS_TEST_OBJSTORE_SKIP} tests"
 	$(MAKE) test
 
 .PHONY: test-local
+test-local: ## Runs test excluding tests for ALL  object storage integrations.
 test-local: export THANOS_TEST_OBJSTORE_SKIP=GCS,S3,AZURE,SWIFT,COS,ALIYUNOSS
 test-local:
 	$(MAKE) test
 
-# install-deps installs dependencies for e2e tetss.
-# It installs supported versions of Prometheus and alertmanager to test against in e2e.
+.PHONY: test-e2e
+test-e2e: ## Runs all Thanos e2e docker-based e2e tests from test/e2e. Required access to docker daemon.
+test-e2e: docker
+	@echo ">> cleaning docker environment."
+	@docker system prune -f --volumes
+	@echo ">> cleaning e2e test garbage."
+	@rm -rf ./test/e2e/e2e_integration_test*
+	@echo ">> running /test/e2e tests."
+	# NOTE(bwplotka):
+	# * If you see errors on CI (timeouts), but not locally, try to add -parallel 1 to limit to single CPU to reproduce small 1CPU machine.
+	@go test $(GOTEST_OPTS) ./test/e2e/...
+
 .PHONY: install-deps
+install-deps: ## Installs dependencies for integration tests. It installs supported versions of Prometheus and alertmanager to test against in integration tests.
 install-deps: $(ALERTMANAGER) $(MINIO_SERVER) $(PROMS)
 	@echo ">>GOBIN=$(GOBIN)"
 
 .PHONY: docker-ci
-# To be run by Thanos maintainer.
+docker-ci: ## Builds and pushes docker image used by our CI. This is done to cache our tools and dependencies. To be run by Thanos maintainer.
 docker-ci: install-deps
 	# Copy all to tmp local dir as this is required by docker.
 	@rm -rf ./tmp/bin
@@ -263,7 +311,6 @@ docker-ci: install-deps
 	@docker tag "thanos-ci" "quay.io/thanos/thanos-ci:$(DOCKER_CI_TAG)"
 	@docker push "quay.io/thanos/thanos-ci:$(DOCKER_CI_TAG)"
 
-# tooling deps. TODO(bwplotka): Pin them all to certain version!
 .PHONY: check-git
 check-git:
 ifneq ($(GIT),)
@@ -278,25 +325,40 @@ web-pre-process:
 	@bash scripts/websitepreprocess.sh
 
 .PHONY: web
+web: ## Builds our website.
 web: web-pre-process $(HUGO)
 	@echo ">> building documentation website"
 	# TODO(bwplotka): Make it --gc
 	@cd $(WEB_DIR) && HUGO_ENV=production $(HUGO) --config hugo.yaml --minify -v -b $(WEBSITE_BASE_URL)
 
-.PHONY: lint
+.PHONY:lint
+lint: ## Runs various static analysis against our code.
+lint: go-lint react-app-lint
+
 # PROTIP:
 # Add
 #      --cpu-profile-path string   Path to CPU profile output file
 #      --mem-profile-path string   Path to memory profile output file
-#
 # to debug big allocations during linting.
-lint: check-git $(GOLANGCILINT) $(MISSPELL)
+.PHONY: go-lint
+go-lint: check-git deps $(GOLANGCILINT) $(MISSPELL) $(FAILLINT)
+	$(call require_clean_work_tree,"detected not clean master before running lint")
+	@echo ">> verifying modules being imported"
+	@# TODO(bwplotka): Add, Printf, DefaultRegisterer, NewGaugeFunc and MustRegister once exception are accepted. Add fmt.{Errorf}=github.com/pkg/errors.{Errorf} once https://github.com/fatih/faillint/issues/10 is addressed.
+	@$(FAILLINT) -paths "errors=github.com/pkg/errors,\
+github.com/prometheus/tsdb=github.com/prometheus/prometheus/tsdb,\
+github.com/prometheus/prometheus/pkg/testutils=github.com/thanos-io/thanos/pkg/testutil,\
+github.com/prometheus/client_golang/prometheus.{DefaultGatherer,DefBuckets,NewUntypedFunc,UntypedFunc},\
+github.com/prometheus/client_golang/prometheus.{NewCounter,NewCounterVec,NewCounterVec,NewGauge,NewGaugeVec,NewGaugeFunc,\
+NewHistorgram,NewHistogramVec,NewSummary,NewSummaryVec}=github.com/prometheus/client_golang/prometheus/promauto.{NewCounter,\
+NewCounterVec,NewCounterVec,NewGauge,NewGaugeVec,NewGaugeFunc,NewHistorgram,NewHistogramVec,NewSummary,NewSummaryVec}" ./...
+	@$(FAILLINT) -paths "fmt.{Print,Println,Sprint}" -ignore-tests ./...
 	@echo ">> examining all of the Go files"
 	@go vet -stdmethods=false ./pkg/... ./cmd/... && go vet doc.go
 	@echo ">> linting all of the Go files GOGC=${GOGC}"
 	@$(GOLANGCILINT) run
 	@echo ">> detecting misspells"
-	@find . -type f | grep -v vendor/ | grep -vE '\./\..*' | xargs $(MISSPELL) -error
+	@find . -type f | grep -v vendor/ | grep -v pkg/ui/react-app/node_modules | grep -v pkg/ui/static | grep -vE '\./\..*' | xargs $(MISSPELL) -error
 	@echo ">> detecting white noise"
 	@find . -type f \( -name "*.md" -o -name "*.go" \) | SED_BIN="$(SED)" xargs scripts/cleanup-white-noise.sh
 	$(call require_clean_work_tree,"detected white noise")
@@ -305,6 +367,7 @@ lint: check-git $(GOLANGCILINT) $(MISSPELL)
 	$(call require_clean_work_tree,"detected files without copyright")
 
 .PHONY: web-serve
+web-serve: ## Builds and serves Thanos website on localhost.
 web-serve: web-pre-process $(HUGO)
 	@echo ">> serving documentation website"
 	@cd $(WEB_DIR) && $(HUGO) --config hugo.yaml -v server
@@ -333,7 +396,7 @@ examples-in-container:
 		examples
 
 .PHONY: examples
-examples: jsonnet-format ${THANOS_MIXIN}/README.md examples/alerts/alerts.md examples/alerts/alerts.yaml examples/alerts/rules.yaml examples/dashboards examples/tmp
+examples: jsonnet-vendor jsonnet-format $(EMBEDMD) ${THANOS_MIXIN}/README.md examples/alerts/alerts.md examples/alerts/alerts.yaml examples/alerts/rules.yaml examples/dashboards examples/tmp
 	$(EMBEDMD) -w examples/alerts/alerts.md
 	$(EMBEDMD) -w ${THANOS_MIXIN}/README.md
 
@@ -344,39 +407,41 @@ examples/tmp:
 	$(JSONNET) -J ${JSONNET_VENDOR_DIR} -m examples/tmp/ ${THANOS_MIXIN}/separated_alerts.jsonnet | xargs -I{} sh -c 'cat {} | $(GOJSONTOYAML) > {}.yaml; rm -f {}' -- {}
 
 .PHONY: examples/dashboards # to keep examples/dashboards/dashboards.md.
-examples/dashboards: $(JSONNET) ${THANOS_MIXIN}/mixin.libsonnet ${THANOS_MIXIN}/defaults.libsonnet ${THANOS_MIXIN}/dashboards/*
+examples/dashboards: $(JSONNET) ${THANOS_MIXIN}/mixin.libsonnet ${THANOS_MIXIN}/config.libsonnet ${THANOS_MIXIN}/dashboards/*
 	-rm -rf examples/dashboards/*.json
 	$(JSONNET) -J ${JSONNET_VENDOR_DIR} -m examples/dashboards ${THANOS_MIXIN}/dashboards.jsonnet
 
-examples/alerts/alerts.yaml: $(JSONNET) $(GOJSONTOYAML) ${THANOS_MIXIN}/mixin.libsonnet ${THANOS_MIXIN}/defaults.libsonnet ${THANOS_MIXIN}/alerts/*
+examples/alerts/alerts.yaml: $(JSONNET) $(GOJSONTOYAML) ${THANOS_MIXIN}/mixin.libsonnet ${THANOS_MIXIN}/config.libsonnet ${THANOS_MIXIN}/alerts/*
 	$(JSONNET) ${THANOS_MIXIN}/alerts.jsonnet | $(GOJSONTOYAML) > $@
 
-examples/alerts/rules.yaml: $(JSONNET) $(GOJSONTOYAML) ${THANOS_MIXIN}/mixin.libsonnet ${THANOS_MIXIN}/defaults.libsonnet ${THANOS_MIXIN}/rules/*
+examples/alerts/rules.yaml: $(JSONNET) $(GOJSONTOYAML) ${THANOS_MIXIN}/mixin.libsonnet ${THANOS_MIXIN}/config.libsonnet ${THANOS_MIXIN}/rules/*
 	$(JSONNET) ${THANOS_MIXIN}/rules.jsonnet | $(GOJSONTOYAML) > $@
 
 .PHONY: jsonnet-vendor
-jsonnet-vendor: $(JSONNET_BUNDLER) $(MIXIN_ROOT)/jsonnetfile.json $(MIXIN_ROOT)/jsonnetfile.lock.json
+jsonnet-vendor: $(JSONNET_BUNDLER) $(THANOS_MIXIN)/jsonnetfile.json $(THANOS_MIXIN)/jsonnetfile.lock.json
 	rm -rf ${JSONNET_VENDOR_DIR}
-	cd ${MIXIN_ROOT} && $(JSONNET_BUNDLER) install
+	cd ${THANOS_MIXIN} && $(JSONNET_BUNDLER) install
 
-JSONNET_FMT := jsonnetfmt -n 2 --max-blank-lines 2 --string-style s --comment-style s
+JSONNETFMT_CMD := $(JSONNETFMT) -n 2 --max-blank-lines 2 --string-style s --comment-style s
 
 .PHONY: jsonnet-format
-jsonnet-format:
-	@which jsonnetfmt 2>&1 >/dev/null || ( \
-		echo "Cannot find jsonnetfmt command, please install from https://github.com/google/jsonnet/releases.\nIf your C++ does not support GLIBCXX_3.4.20, please use xxx-in-container target like jsonnet-format-in-container." \
-		&& exit 1)
+jsonnet-format: $(JSONNETFMT)
 	find . -name 'vendor' -prune -o -name '*.libsonnet' -print -o -name '*.jsonnet' -print | \
-		xargs -n 1 -- $(JSONNET_FMT) -i
+		xargs -n 1 -- $(JSONNETFMT_CMD) -i
 
 .PHONY: jsonnet-format-in-container
 jsonnet-format-in-container:
-	$(JSONNET_CONTAINER_CMD) make $(MFLAGS) jsonnet-format
+	$(JSONNET_CONTAINER_CMD) find . -name 'vendor' -prune -o -name '*.libsonnet' -print -o -name '*.jsonnet' -print | \
+		xargs -n 1 -- jsonnetfmt -n 2 --max-blank-lines 2 --string-style s --comment-style s -i
 
 .PHONY: example-rules-lint
 example-rules-lint: $(PROMTOOL) examples/alerts/alerts.yaml examples/alerts/rules.yaml
 	$(PROMTOOL) check rules examples/alerts/alerts.yaml examples/alerts/rules.yaml
 	$(PROMTOOL) test rules examples/alerts/tests.yaml
+
+.PHONY: check-examples
+check-examples: examples example-rules-lint
+	$(call require_clean_work_tree,'all generated files should be committed,check examples')
 
 .PHONY: examples-clean
 examples-clean:
@@ -418,6 +483,9 @@ $(ALERTMANAGER):
 $(MINIO_SERVER):
 	$(call fetch_go_bin_version,github.com/minio/minio,$(MINIO_SERVER_VERSION))
 
+$(FAILLINT):
+	$(call fetch_go_bin_version,github.com/fatih/faillint,$(FAILLINT_VERSION))
+
 $(PROMS):
 	$(foreach ver,$(PROM_VERSIONS),$(call fetch_go_bin_version,github.com/prometheus/prometheus/cmd/prometheus,$(ver)))
 
@@ -431,6 +499,9 @@ $(PROTOC):
 
 $(JSONNET):
 	$(call fetch_go_bin_version,github.com/google/go-jsonnet/cmd/jsonnet,$(JSONNET_VERSION))
+
+$(JSONNETFMT):
+	$(call fetch_go_bin_version,github.com/google/go-jsonnet/cmd/jsonnetfmt,$(JSONNET_VERSION))
 
 $(GOJSONTOYAML):
 	$(call fetch_go_bin_version,github.com/brancz/gojsontoyaml,$(GOJSONTOYAML_VERSION))

@@ -27,10 +27,14 @@ var testGRPCOpts = []grpc.DialOption{
 }
 
 type testStore struct {
-	info storepb.InfoResponse
+	infoDelay time.Duration
+	info      storepb.InfoResponse
 }
 
 func (s *testStore) Info(ctx context.Context, r *storepb.InfoRequest) (*storepb.InfoResponse, error) {
+	if s.infoDelay > 0 {
+		time.Sleep(s.infoDelay)
+	}
 	return &s.info, nil
 }
 
@@ -51,8 +55,10 @@ func (s *testStore) LabelValues(ctx context.Context, r *storepb.LabelValuesReque
 }
 
 type testStoreMeta struct {
-	extlsetFn func(addr string) []storepb.LabelSet
-	storeType component.StoreAPI
+	extlsetFn        func(addr string) []storepb.LabelSet
+	storeType        component.StoreAPI
+	minTime, maxTime int64
+	infoDelay        time.Duration
 }
 
 type testStores struct {
@@ -78,7 +84,10 @@ func startTestStores(storeMetas []testStoreMeta) (*testStores, error) {
 		storeSrv := &testStore{
 			info: storepb.InfoResponse{
 				LabelSets: meta.extlsetFn(listener.Addr().String()),
+				MaxTime:   meta.maxTime,
+				MinTime:   meta.minTime,
 			},
+			infoDelay: meta.infoDelay,
 		}
 		if meta.storeType != nil {
 			storeSrv.info.StoreType = meta.storeType.ToProto()
@@ -174,19 +183,22 @@ func TestStoreSet_Update(t *testing.T) {
 
 	discoveredStoreAddr := stores.StoreAddresses()
 
-	// Start with one not available.
-	stores.CloseOne(discoveredStoreAddr[2])
-
 	// Testing if duplicates can cause weird results.
 	discoveredStoreAddr = append(discoveredStoreAddr, discoveredStoreAddr[0])
 	storeSet := NewStoreSet(nil, nil, func() (specs []StoreSpec) {
 		for _, addr := range discoveredStoreAddr {
-			specs = append(specs, NewGRPCStoreSpec(addr))
+			specs = append(specs, NewGRPCStoreSpec(addr, false))
 		}
 		return specs
 	}, testGRPCOpts, time.Minute)
 	storeSet.gRPCInfoCallTimeout = 2 * time.Second
 	defer storeSet.Close()
+
+	// Initial update.
+	storeSet.Update(context.Background())
+
+	// Start with one not available.
+	stores.CloseOne(discoveredStoreAddr[2])
 
 	// Should not matter how many of these we run.
 	storeSet.Update(context.Background())
@@ -455,7 +467,7 @@ func TestStoreSet_Update(t *testing.T) {
 
 	// Check stats.
 	expected = newStoreAPIStats()
-	expected[component.StoreAPI(nil)] = map[string]int{
+	expected[component.UnknownStoreAPI] = map[string]int{
 		"{l1=\"no-store-type\", l2=\"v3\"}": 1,
 	}
 	expected[component.Query] = map[string]int{
@@ -523,7 +535,7 @@ func TestStoreSet_Update_NoneAvailable(t *testing.T) {
 
 	storeSet := NewStoreSet(nil, nil, func() (specs []StoreSpec) {
 		for _, addr := range initialStoreAddr {
-			specs = append(specs, NewGRPCStoreSpec(addr))
+			specs = append(specs, NewGRPCStoreSpec(addr, false))
 		}
 		return specs
 	}, testGRPCOpts, time.Minute)
@@ -532,10 +544,111 @@ func TestStoreSet_Update_NoneAvailable(t *testing.T) {
 	// Should not matter how many of these we run.
 	storeSet.Update(context.Background())
 	storeSet.Update(context.Background())
-	testutil.Assert(t, len(storeSet.stores) == 0, "none of services should respond just fine, so we expect no client to be ready.")
+	testutil.Equals(t, 0, len(storeSet.stores), "none of services should respond just fine, so we expect no client to be ready.")
 
 	// Leak test will ensure that we don't keep client connection around.
 
 	expected := newStoreAPIStats()
 	testutil.Equals(t, expected, storeSet.storesMetric.storeNodes)
+}
+
+// TestQuerierStrict tests what happens when the strict mode is enabled/disabled.
+func TestQuerierStrict(t *testing.T) {
+	defer leaktest.CheckTimeout(t, 5*time.Second)()
+
+	st, err := startTestStores([]testStoreMeta{
+		{
+			minTime: 12345,
+			maxTime: 54321,
+			extlsetFn: func(addr string) []storepb.LabelSet {
+				return []storepb.LabelSet{
+					{
+						Labels: []storepb.Label{
+							{
+								Name:  "addr",
+								Value: addr,
+							},
+						},
+					},
+				}
+			},
+			storeType: component.Sidecar,
+		},
+		{
+			minTime: 66666,
+			maxTime: 77777,
+			extlsetFn: func(addr string) []storepb.LabelSet {
+				return []storepb.LabelSet{
+					{
+						Labels: []storepb.Label{
+							{
+								Name:  "addr",
+								Value: addr,
+							},
+						},
+					},
+				}
+			},
+			storeType: component.Sidecar,
+		},
+		// Slow store.
+		{
+			minTime: 65644,
+			maxTime: 77777,
+			extlsetFn: func(addr string) []storepb.LabelSet {
+				return []storepb.LabelSet{
+					{
+						Labels: []storepb.Label{
+							{
+								Name:  "addr",
+								Value: addr,
+							},
+						},
+					},
+				}
+			},
+			storeType: component.Sidecar,
+			infoDelay: 2 * time.Second,
+		},
+	})
+
+	testutil.Ok(t, err)
+	defer st.Close()
+
+	staticStoreAddr := st.StoreAddresses()[0]
+	storeSet := NewStoreSet(nil, nil, func() (specs []StoreSpec) {
+		return []StoreSpec{
+			NewGRPCStoreSpec(st.StoreAddresses()[0], true),
+			NewGRPCStoreSpec(st.StoreAddresses()[1], false),
+			NewGRPCStoreSpec(st.StoreAddresses()[2], true),
+		}
+	}, testGRPCOpts, time.Minute)
+	defer storeSet.Close()
+	storeSet.gRPCInfoCallTimeout = 1 * time.Second
+
+	// Initial update.
+	storeSet.Update(context.Background())
+	testutil.Equals(t, 3, len(storeSet.stores), "three clients must be available for running store nodes")
+
+	testutil.Assert(t, storeSet.stores[st.StoreAddresses()[2]].cc.GetState().String() != "SHUTDOWN", "slow store's connection should not be closed")
+
+	// The store is statically defined + strict mode is enabled
+	// so its client + information must be retained.
+	curMin, curMax := storeSet.stores[staticStoreAddr].minTime, storeSet.stores[staticStoreAddr].maxTime
+	testutil.Equals(t, int64(12345), curMin, "got incorrect minimum time")
+	testutil.Equals(t, int64(54321), curMax, "got incorrect minimum time")
+
+	// Turn off the stores.
+	st.Close()
+
+	// Update again many times. Should not matter WRT the static one.
+	storeSet.Update(context.Background())
+	storeSet.Update(context.Background())
+	storeSet.Update(context.Background())
+
+	// Check that the information is the same.
+	testutil.Equals(t, 2, len(storeSet.stores), "two static clients must remain available")
+	testutil.Equals(t, curMin, storeSet.stores[staticStoreAddr].minTime, "minimum time reported by the store node is different")
+	testutil.Equals(t, curMax, storeSet.stores[staticStoreAddr].maxTime, "minimum time reported by the store node is different")
+	testutil.NotOk(t, storeSet.storeStatuses[staticStoreAddr].LastError)
 }

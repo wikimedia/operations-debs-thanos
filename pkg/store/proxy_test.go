@@ -7,7 +7,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"math"
 	"os"
 	"sort"
 	"testing"
@@ -15,6 +14,7 @@ import (
 
 	"github.com/fortytw2/leaktest"
 	"github.com/gogo/protobuf/proto"
+	"github.com/gogo/protobuf/types"
 	"github.com/pkg/errors"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
@@ -69,7 +69,7 @@ func TestProxyStore_Info(t *testing.T) {
 	testutil.Equals(t, []storepb.LabelSet(nil), resp.LabelSets)
 	testutil.Equals(t, storepb.StoreType_QUERY, resp.StoreType)
 	testutil.Equals(t, int64(0), resp.MinTime)
-	testutil.Equals(t, int64(math.MaxInt64), resp.MaxTime)
+	testutil.Equals(t, int64(0), resp.MaxTime)
 }
 
 func TestProxyStore_Series(t *testing.T) {
@@ -463,6 +463,60 @@ func TestProxyStore_SeriesSlowStores(t *testing.T) {
 		expectedErr         error
 		expectedWarningsLen int
 	}{
+		{
+			title: "partial response disabled; 1st errors out after some delay; 2nd store is fast",
+			storeAPIs: []Client{
+				&testClient{
+					StoreClient: &mockedStoreAPI{
+						RespSeries: []*storepb.SeriesResponse{
+							storepb.NewWarnSeriesResponse(errors.New("warning")),
+							storeSeriesResponse(t, labels.FromStrings("a", "b"), []sample{{1, 1}, {2, 2}, {3, 3}}),
+						},
+						RespDuration:       2 * time.Second,
+						SlowSeriesIndex:    1,
+						injectedError:      errors.New("test"),
+						injectedErrorIndex: 1,
+					},
+					labelSets: []storepb.LabelSet{{Labels: []storepb.Label{{Name: "ext", Value: "1"}}}},
+					minTime:   1,
+					maxTime:   300,
+				},
+				&testClient{
+					StoreClient: &mockedStoreAPI{
+						RespSeries: []*storepb.SeriesResponse{
+							storepb.NewWarnSeriesResponse(errors.New("warning")),
+							storeSeriesResponse(t, labels.FromStrings("b", "a"), []sample{{4, 1}, {5, 2}, {6, 3}}),
+							storeSeriesResponse(t, labels.FromStrings("b", "a"), []sample{{4, 1}, {5, 2}, {6, 3}}),
+							storeSeriesResponse(t, labels.FromStrings("b", "a"), []sample{{4, 1}, {5, 2}, {6, 3}}),
+							storeSeriesResponse(t, labels.FromStrings("b", "a"), []sample{{4, 1}, {5, 2}, {6, 3}}),
+							storeSeriesResponse(t, labels.FromStrings("b", "a"), []sample{{4, 1}, {5, 2}, {6, 3}}),
+
+							storeSeriesResponse(t, labels.FromStrings("b", "a"), []sample{{4, 1}, {5, 2}, {6, 3}}),
+							storeSeriesResponse(t, labels.FromStrings("b", "a"), []sample{{4, 1}, {5, 2}, {6, 3}}),
+							storeSeriesResponse(t, labels.FromStrings("b", "a"), []sample{{4, 1}, {5, 2}, {6, 3}}),
+							storeSeriesResponse(t, labels.FromStrings("b", "a"), []sample{{4, 1}, {5, 2}, {6, 3}}),
+							storeSeriesResponse(t, labels.FromStrings("b", "a"), []sample{{4, 1}, {5, 2}, {6, 3}}),
+
+							storeSeriesResponse(t, labels.FromStrings("b", "a"), []sample{{4, 1}, {5, 2}, {6, 3}}),
+							storeSeriesResponse(t, labels.FromStrings("b", "a"), []sample{{4, 1}, {5, 2}, {6, 3}}),
+							storeSeriesResponse(t, labels.FromStrings("b", "a"), []sample{{4, 1}, {5, 2}, {6, 3}}),
+							storeSeriesResponse(t, labels.FromStrings("b", "a"), []sample{{4, 1}, {5, 2}, {6, 3}}),
+							storeSeriesResponse(t, labels.FromStrings("b", "a"), []sample{{4, 1}, {5, 2}, {6, 3}}),
+						},
+					},
+					labelSets: []storepb.LabelSet{{Labels: []storepb.Label{{Name: "ext", Value: "1"}}}},
+					minTime:   1,
+					maxTime:   300,
+				},
+			},
+			req: &storepb.SeriesRequest{
+				MinTime:                 1,
+				MaxTime:                 300,
+				Matchers:                []storepb.LabelMatcher{{Name: "ext", Value: "1", Type: storepb.LabelMatcher_EQ}},
+				PartialResponseDisabled: true,
+			},
+			expectedErr: errors.New("test: receive series from test: test"),
+		},
 		{
 			title: "partial response disabled; 1st store is slow, 2nd store is fast;",
 			storeAPIs: []Client{
@@ -1310,6 +1364,9 @@ type storeSeriesServer struct {
 
 	SeriesSet []storepb.Series
 	Warnings  []string
+	HintsSet  []*types.Any
+
+	Size int64
 }
 
 func newStoreSeriesServer(ctx context.Context) *storeSeriesServer {
@@ -1317,15 +1374,24 @@ func newStoreSeriesServer(ctx context.Context) *storeSeriesServer {
 }
 
 func (s *storeSeriesServer) Send(r *storepb.SeriesResponse) error {
+	s.Size += int64(r.Size())
+
 	if r.GetWarning() != "" {
 		s.Warnings = append(s.Warnings, r.GetWarning())
 		return nil
 	}
 
-	if r.GetSeries() == nil {
-		return errors.New("no seriesSet")
+	if r.GetSeries() != nil {
+		s.SeriesSet = append(s.SeriesSet, *r.GetSeries())
+		return nil
 	}
-	s.SeriesSet = append(s.SeriesSet, *r.GetSeries())
+
+	if r.GetHints() != nil {
+		s.HintsSet = append(s.HintsSet, r.GetHints())
+		return nil
+	}
+
+	// Unsupported field, skip.
 	return nil
 }
 
@@ -1346,6 +1412,10 @@ type mockedStoreAPI struct {
 	LastSeriesReq      *storepb.SeriesRequest
 	LastLabelValuesReq *storepb.LabelValuesRequest
 	LastLabelNamesReq  *storepb.LabelNamesRequest
+
+	// injectedError will be injected into Recv() if not nil.
+	injectedError      error
+	injectedErrorIndex int
 }
 
 func (s *mockedStoreAPI) Info(ctx context.Context, req *storepb.InfoRequest, _ ...grpc.CallOption) (*storepb.InfoResponse, error) {
@@ -1355,7 +1425,7 @@ func (s *mockedStoreAPI) Info(ctx context.Context, req *storepb.InfoRequest, _ .
 func (s *mockedStoreAPI) Series(ctx context.Context, req *storepb.SeriesRequest, _ ...grpc.CallOption) (storepb.Store_SeriesClient, error) {
 	s.LastSeriesReq = req
 
-	return &StoreSeriesClient{ctx: ctx, respSet: s.RespSeries, respDur: s.RespDuration, slowSeriesIndex: s.SlowSeriesIndex}, s.RespError
+	return &StoreSeriesClient{injectedErrorIndex: s.injectedErrorIndex, injectedError: s.injectedError, ctx: ctx, respSet: s.RespSeries, respDur: s.RespDuration, slowSeriesIndex: s.SlowSeriesIndex}, s.RespError
 }
 
 func (s *mockedStoreAPI) LabelNames(ctx context.Context, req *storepb.LabelNamesRequest, _ ...grpc.CallOption) (*storepb.LabelNamesResponse, error) {
@@ -1379,11 +1449,17 @@ type StoreSeriesClient struct {
 	respSet         []*storepb.SeriesResponse
 	respDur         time.Duration
 	slowSeriesIndex int
+
+	injectedError      error
+	injectedErrorIndex int
 }
 
 func (c *StoreSeriesClient) Recv() (*storepb.SeriesResponse, error) {
 	if c.respDur != 0 && (c.slowSeriesIndex == c.i || c.slowSeriesIndex == 0) {
 		time.Sleep(c.respDur)
+	}
+	if c.injectedError != nil && (c.injectedErrorIndex == c.i || c.injectedErrorIndex == 0) {
+		return nil, c.injectedError
 	}
 
 	if c.i >= len(c.respSet) {

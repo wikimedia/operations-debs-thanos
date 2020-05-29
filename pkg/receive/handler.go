@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
@@ -22,10 +23,12 @@ import (
 	opentracing "github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/common/route"
-	"github.com/prometheus/prometheus/prompb"
 	"github.com/prometheus/prometheus/storage"
+	"github.com/prometheus/prometheus/tsdb"
 	terrors "github.com/prometheus/prometheus/tsdb/errors"
+	"github.com/thanos-io/thanos/pkg/store/storepb/prompb"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -39,6 +42,10 @@ import (
 const (
 	// DefaultTenantHeader is the default header used to designate the tenant making a write request.
 	DefaultTenantHeader = "THANOS-TENANT"
+	// DefaultTenant is the default value used for when no tenant is passed via the tenant header.
+	DefaultTenant = "default-tenant"
+	// DefaultTenantLabel is the default label-name used for when no tenant is passed via the tenant header.
+	DefaultTenantLabel = "tenant_id"
 	// DefaultReplicaHeader is the default header used to designate the replica count of a write request.
 	DefaultReplicaHeader = "THANOS-REPLICA"
 )
@@ -54,13 +61,14 @@ type Options struct {
 	ListenAddress     string
 	Registry          prometheus.Registerer
 	TenantHeader      string
+	DefaultTenantID   string
 	ReplicaHeader     string
 	Endpoint          string
 	ReplicationFactor uint64
 	Tracer            opentracing.Tracer
 	TLSConfig         *tls.Config
-	TLSClientConfig   *tls.Config
 	DialOpts          []grpc.DialOption
+	ForwardTimeout    time.Duration
 }
 
 // Handler serves a Prometheus remote write receiving HTTP endpoint.
@@ -90,7 +98,7 @@ func NewHandler(logger log.Logger, o *Options) *Handler {
 		router:  route.New(),
 		options: o,
 		peers:   newPeerGroup(o.DialOpts...),
-		forwardRequestsTotal: prometheus.NewCounterVec(
+		forwardRequestsTotal: promauto.With(o.Registry).NewCounterVec(
 			prometheus.CounterOpts{
 				Name: "thanos_receive_forward_requests_total",
 				Help: "The number of forward requests.",
@@ -101,7 +109,6 @@ func NewHandler(logger log.Logger, o *Options) *Handler {
 	ins := extpromhttp.NewNopInstrumentationMiddleware()
 	if o.Registry != nil {
 		ins = extpromhttp.NewInstrumentationMiddleware(o.Registry)
-		o.Registry.MustRegister(h.forwardRequestsTotal)
 	}
 
 	readyf := h.testReady
@@ -115,16 +122,6 @@ func NewHandler(logger log.Logger, o *Options) *Handler {
 	h.router.Post("/api/v1/receive", instrf("receive", readyf(h.receiveHTTP)))
 
 	return h
-}
-
-// SetWriter sets the writer.
-// The writer must be set to a non-nil value in order for the
-// handler to be ready and usable.
-// If the writer is nil, then the handler is marked as not ready.
-func (h *Handler) SetWriter(w *Writer) {
-	h.mtx.Lock()
-	defer h.mtx.Unlock()
-	h.writer = w
 }
 
 // Hashring sets the hashring for the handler and marks the hashring as ready.
@@ -192,6 +189,13 @@ func (h *Handler) Run() error {
 		TLSConfig: h.options.TLSConfig,
 	}
 
+	if h.options.TLSConfig != nil {
+		level.Info(h.logger).Log("msg", "Serving HTTPS", "address", h.options.ListenAddress)
+		// Cert & Key are already being passed in via TLSConfig.
+		return httpSrv.ServeTLS(h.listener, "", "")
+	}
+
+	level.Info(h.logger).Log("msg", "Serving plain HTTP", "address", h.options.ListenAddress)
 	return httpSrv.Serve(h.listener)
 }
 
@@ -260,11 +264,16 @@ func (h *Handler) receiveHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	tenant := r.Header.Get(h.options.TenantHeader)
+	if len(tenant) == 0 {
+		tenant = h.options.DefaultTenantID
+	}
 
 	err = h.handleRequest(r.Context(), rep, tenant, &wreq)
 	switch err {
 	case nil:
 		return
+	case tsdb.ErrNotReady:
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 	case conflictErr:
 		http.Error(w, err.Error(), http.StatusConflict)
 	case errBadReplica:
@@ -317,32 +326,38 @@ func (h *Handler) forward(ctx context.Context, tenant string, r replica, wreq *p
 	}
 	h.mtx.RUnlock()
 
-	return h.parallelizeRequests(ctx, tenant, replicas, wreqs)
+	return h.fanoutForward(ctx, tenant, replicas, wreqs, len(wreqs))
 }
 
-// parallelizeRequests parallelizes a given set of write requests.
-// The function only returns when all requests have finished
-// or the context is canceled.
-func (h *Handler) parallelizeRequests(ctx context.Context, tenant string, replicas map[string]replica, wreqs map[string]*prompb.WriteRequest) error {
+// writeQuorum returns minimum number of replicas that has to confirm write success before claiming replication success.
+func (h *Handler) writeQuorum() int {
+	return int((h.options.ReplicationFactor / 2) + 1)
+}
+
+// fanoutForward fanouts concurrently given set of write requests. It returns status immediately when quorum of
+// requests succeeds or fails or if context is cancelled.
+func (h *Handler) fanoutForward(ctx context.Context, tenant string, replicas map[string]replica, wreqs map[string]*prompb.WriteRequest, successThreshold int) error {
 	ec := make(chan error)
-	defer close(ec)
-	// We don't wan't to use a sync.WaitGroup here because that
-	// introduces an unnecessary second synchronization mechanism,
-	// the first being the error chan. Plus, it saves us a goroutine
-	// as in order to collect errors while doing wg.Wait, we would
-	// need a separate error collection goroutine.
-	var n int
+
+	var wg sync.WaitGroup
 	for endpoint := range wreqs {
-		n++
+		wg.Add(1)
+
 		// If the request is not yet replicated, let's replicate it.
 		// If the replication factor isn't greater than 1, let's
 		// just forward the requests.
 		if !replicas[endpoint].replicated && h.options.ReplicationFactor > 1 {
 			go func(endpoint string) {
-				ec <- h.replicate(ctx, tenant, wreqs[endpoint])
+				defer wg.Done()
+				if err := h.replicate(ctx, tenant, wreqs[endpoint]); err != nil {
+					ec <- errors.Wrap(err, "replicate write request")
+					return
+				}
+				ec <- nil
 			}(endpoint)
 			continue
 		}
+
 		// If the endpoint for the write request is the
 		// local node, then don't make a request but store locally.
 		// By handing replication to the local node in the same
@@ -351,37 +366,42 @@ func (h *Handler) parallelizeRequests(ctx context.Context, tenant string, replic
 		// can be ignored if the replication factor is met.
 		if endpoint == h.options.Endpoint {
 			go func(endpoint string) {
+				defer wg.Done()
 				var err error
-				h.mtx.RLock()
-				if h.writer == nil {
-					err = errors.New("storage is not ready")
-				} else {
-					err = h.writer.Write(wreqs[endpoint])
+				tracing.DoInSpan(ctx, "receive_tsdb_write", func(ctx context.Context) {
+					err = h.writer.Write(tenant, wreqs[endpoint])
+				})
+				if err != nil {
 					// When a MultiError is added to another MultiError, the error slices are concatenated, not nested.
 					// To avoid breaking the counting logic, we need to flatten the error.
 					if errs, ok := err.(terrors.MultiError); ok {
 						if countCause(errs, isConflict) > 0 {
 							err = errors.Wrap(conflictErr, errs.Error())
+						} else if countCause(errs, isNotReady) > 0 {
+							err = tsdb.ErrNotReady
 						} else {
 							err = errors.New(errs.Error())
 						}
 					}
+					ec <- errors.Wrapf(err, "storing locally, endpoint %v", endpoint)
+					return
 				}
-				h.mtx.RUnlock()
-				if err != nil {
-					level.Error(h.logger).Log("msg", "storing locally", "err", err, "endpoint", endpoint)
-				}
-				ec <- err
+				ec <- nil
+
 			}(endpoint)
 			continue
 		}
+
 		// Make a request to the specified endpoint.
 		go func(endpoint string) {
-			var err error
+			defer wg.Done()
 
-			// Increment the counters as necessary now that
-			// the requests will go out.
+			var (
+				err error
+				cl  storepb.WriteableStoreClient
+			)
 			defer func() {
+				// This is an actual remote forward request so report metric here.
 				if err != nil {
 					h.forwardRequestsTotal.WithLabelValues("error").Inc()
 					return
@@ -389,46 +409,71 @@ func (h *Handler) parallelizeRequests(ctx context.Context, tenant string, replic
 				h.forwardRequestsTotal.WithLabelValues("success").Inc()
 			}()
 
-			cl, err := h.peers.get(ctx, endpoint)
+			cl, err = h.peers.get(ctx, endpoint)
 			if err != nil {
-				level.Error(h.logger).Log("msg", "failed to get peer connection to forward request", "err", err, "endpoint", endpoint)
-				ec <- err
+				ec <- errors.Wrapf(err, "get peer connection for endpoint %v", endpoint)
 				return
 			}
-
 			// Create a span to track the request made to another receive node.
-			span, ctx := tracing.StartSpan(ctx, "thanos_receive_forward")
-			defer span.Finish()
-
-			// Actually make the request against the endpoint
-			// we determined should handle these time series.
-			_, err = cl.RemoteWrite(ctx, &storepb.WriteRequest{
-				Timeseries: wreqs[endpoint].Timeseries,
-				Tenant:     tenant,
-				Replica:    int64(replicas[endpoint].n + 1), // increment replica since on-the-wire format is 1-indexed and 0 indicates unreplicated.
+			tracing.DoInSpan(ctx, "receive_forward", func(ctx context.Context) {
+				// Actually make the request against the endpoint we determined should handle these time series.
+				_, err = cl.RemoteWrite(ctx, &storepb.WriteRequest{
+					Timeseries: wreqs[endpoint].Timeseries,
+					Tenant:     tenant,
+					// Increment replica since on-the-wire format is 1-indexed and 0 indicates un-replicated.
+					Replica: int64(replicas[endpoint].n + 1),
+				})
 			})
 			if err != nil {
-				level.Error(h.logger).Log("msg", "forwarding request", "err", err, "endpoint", endpoint)
-				ec <- err
+				ec <- errors.Wrapf(err, "forwarding request to endpoint %v", endpoint)
 				return
 			}
 			ec <- nil
 		}(endpoint)
 	}
 
-	// Collect any errors from forwarding the time series.
-	// Rather than doing a wg.Wait here, we decrement a counter
-	// for every error received on the chan. This simplifies
-	// error collection and avoids data races with a separate
-	// error collection goroutine.
-	var errs terrors.MultiError
-	for ; n > 0; n-- {
-		if err := <-ec; err != nil {
+	go func() {
+		wg.Wait()
+		close(ec)
+	}()
+
+	// At the end, make sure to exhaust the channel, letting remaining unnecessary requests finish asnychronously.
+	// This is needed if context is cancelled or if we reached success of fail quorum faster.
+	defer func() {
+		go func() {
+			for err := range ec {
+				if err != nil {
+					level.Debug(h.logger).Log("msg", "request failed, but not needed to achieve quorum", "err", err)
+				}
+			}
+		}()
+	}()
+
+	var (
+		success int
+		errs    terrors.MultiError
+	)
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case err, more := <-ec:
+			if !more {
+				return errs
+			}
+			if err == nil {
+				success++
+				if success >= successThreshold {
+					// In case the success threshold is lower than the total
+					// number of requests, then we can finish early here. This
+					// is the case for quorum writes for example.
+					return nil
+				}
+				continue
+			}
 			errs.Add(err)
 		}
 	}
-
-	return errs.Err()
 }
 
 // replicate replicates a write request to (replication-factor) nodes
@@ -459,17 +504,22 @@ func (h *Handler) replicate(ctx context.Context, tenant string, wreq *prompb.Wri
 	}
 	h.mtx.RUnlock()
 
-	err := h.parallelizeRequests(ctx, tenant, replicas, wreqs)
-	if errs, ok := err.(terrors.MultiError); ok {
-		if uint64(countCause(errs, isConflict)) >= (h.options.ReplicationFactor+1)/2 {
-			return errors.Wrap(conflictErr, "did not meet replication threshold")
-		}
-		if uint64(len(errs)) >= (h.options.ReplicationFactor+1)/2 {
-			return errors.Wrap(err, "did not meet replication threshold")
-		}
-		return nil
+	ctx, cancel := context.WithTimeout(ctx, h.options.ForwardTimeout)
+	defer cancel()
+
+	quorum := h.writeQuorum()
+	err := h.fanoutForward(ctx, tenant, replicas, wreqs, quorum)
+	if countCause(err, isNotReady) >= quorum {
+		return tsdb.ErrNotReady
 	}
-	return errors.Wrap(err, "could not replicate write request")
+	if countCause(err, isConflict) >= quorum {
+		return errors.Wrap(conflictErr, "did not meet success threshold due to conflict")
+	}
+	if err != nil {
+		return errors.Wrap(err, "replicate")
+	}
+
+	return nil
 }
 
 // RemoteWrite implements the gRPC remote write handler for storepb.WriteableStore.
@@ -478,6 +528,8 @@ func (h *Handler) RemoteWrite(ctx context.Context, r *storepb.WriteRequest) (*st
 	switch err {
 	case nil:
 		return &storepb.WriteResponse{}, nil
+	case tsdb.ErrNotReady:
+		return nil, status.Error(codes.Unavailable, err.Error())
 	case conflictErr:
 		return nil, status.Error(codes.AlreadyExists, err.Error())
 	case errBadReplica:
@@ -516,6 +568,12 @@ func isConflict(err error) bool {
 		err == storage.ErrOutOfBounds ||
 		err.Error() == strconv.Itoa(http.StatusConflict) ||
 		status.Code(err) == codes.AlreadyExists
+}
+
+// isNotReady returns whether or not the given error represents a not ready error.
+func isNotReady(err error) bool {
+	return err == tsdb.ErrNotReady ||
+		status.Code(err) == codes.Unavailable
 }
 
 func newPeerGroup(dialOpts ...grpc.DialOption) *peerGroup {

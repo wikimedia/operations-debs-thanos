@@ -27,11 +27,15 @@ import (
 
 type nopAppendable struct{}
 
-func (n nopAppendable) Add(l labels.Labels, t int64, v float64) (uint64, error)       { return 0, nil }
-func (n nopAppendable) AddFast(l labels.Labels, ref uint64, t int64, v float64) error { return nil }
-func (n nopAppendable) Commit() error                                                 { return nil }
-func (n nopAppendable) Rollback() error                                               { return nil }
-func (n nopAppendable) Appender() (storage.Appender, error)                           { return n, nil }
+func (n nopAppendable) Appender() storage.Appender { return nopAppender{} }
+
+type nopAppender struct{}
+
+func (n nopAppender) Add(l labels.Labels, t int64, v float64) (uint64, error) { return 0, nil }
+func (n nopAppender) AddFast(ref uint64, t int64, v float64) error            { return nil }
+func (n nopAppender) Commit() error                                           { return nil }
+func (n nopAppender) Rollback() error                                         { return nil }
+func (n nopAppender) Appender() (storage.Appender, error)                     { return n, nil }
 
 // Regression test against https://github.com/thanos-io/thanos/issues/1779.
 func TestRun(t *testing.T) {
@@ -66,14 +70,17 @@ groups:
 		Appendable: nopAppendable{},
 	}
 	thanosRuleMgr := NewManager(dir)
-	ruleMgr := rules.NewManager(&opts)
-	thanosRuleMgr.SetRuleManager(storepb.PartialResponseStrategy_ABORT, ruleMgr)
-	thanosRuleMgr.SetRuleManager(storepb.PartialResponseStrategy_WARN, ruleMgr)
+	ruleMgrAbort := rules.NewManager(&opts)
+	ruleMgrWarn := rules.NewManager(&opts)
+	thanosRuleMgr.SetRuleManager(storepb.PartialResponseStrategy_ABORT, ruleMgrAbort)
+	thanosRuleMgr.SetRuleManager(storepb.PartialResponseStrategy_WARN, ruleMgrWarn)
+
+	ruleMgrAbort.Run()
+	ruleMgrWarn.Run()
+	defer ruleMgrAbort.Stop()
+	defer ruleMgrWarn.Stop()
 
 	testutil.Ok(t, thanosRuleMgr.Update(10*time.Second, []string{filepath.Join(dir, "rule.yaml")}))
-
-	ruleMgr.Run()
-	defer ruleMgr.Stop()
 
 	select {
 	case <-time.After(2 * time.Minute):
@@ -225,6 +232,44 @@ groups:
 	}
 }
 
+func TestUpdateAfterClear(t *testing.T) {
+	dir, err := ioutil.TempDir("", "test_rule_rule_groups")
+	testutil.Ok(t, err)
+	defer func() { testutil.Ok(t, os.RemoveAll(dir)) }()
+
+	testutil.Ok(t, ioutil.WriteFile(filepath.Join(dir, "no_strategy.yaml"), []byte(`
+groups:
+- name: "something1"
+  rules:
+  - alert: "some"
+    expr: "up"
+`), os.ModePerm))
+
+	opts := rules.ManagerOptions{
+		Logger: log.NewLogfmtLogger(os.Stderr),
+	}
+	m := NewManager(dir)
+	ruleMgrAbort := rules.NewManager(&opts)
+	ruleMgrWarn := rules.NewManager(&opts)
+	m.SetRuleManager(storepb.PartialResponseStrategy_ABORT, ruleMgrAbort)
+	m.SetRuleManager(storepb.PartialResponseStrategy_WARN, ruleMgrWarn)
+
+	ruleMgrAbort.Run()
+	ruleMgrWarn.Run()
+	defer ruleMgrAbort.Stop()
+	defer ruleMgrWarn.Stop()
+
+	err = m.Update(1*time.Second, []string{
+		filepath.Join(dir, "no_strategy.yaml"),
+	})
+	testutil.Ok(t, err)
+	testutil.Equals(t, 1, len(m.RuleGroups()))
+
+	err = m.Update(1*time.Second, []string{})
+	testutil.Ok(t, err)
+	testutil.Equals(t, 0, len(m.RuleGroups()))
+}
+
 func TestRuleGroupMarshalYAML(t *testing.T) {
 	const expected = `groups:
 - name: something1
@@ -242,7 +287,7 @@ func TestRuleGroupMarshalYAML(t *testing.T) {
 	var input = RuleGroups{
 		Groups: []RuleGroup{
 			{
-				RuleGroup: rulefmt.RuleGroup{
+				PromRuleGroup: PromRuleGroup{
 					Name: "something1",
 					Rules: []rulefmt.Rule{
 						{
@@ -253,7 +298,7 @@ func TestRuleGroupMarshalYAML(t *testing.T) {
 				},
 			},
 			{
-				RuleGroup: rulefmt.RuleGroup{
+				PromRuleGroup: PromRuleGroup{
 					Name: "something2",
 					Rules: []rulefmt.Rule{
 						{
