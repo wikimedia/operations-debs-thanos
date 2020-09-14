@@ -39,7 +39,7 @@ pre {
     padding: 1rem;
 }
 
-.list-group-item-thanos {
+.list-group-item-docs {
     color: #6D41FF;
     border: 0;
     padding: 0.5rem;
@@ -47,7 +47,7 @@ pre {
     text-indent: 1rem;
 }
 
-.list-group-item-thanos:hover {
+.list-group-item-docs:hover {
     color: #6D41FF;
 }
 
@@ -72,12 +72,62 @@ pre {
 .header-anchor { font-size: 100%; visibility: hidden;}
 h1:hover a, h2:hover a, h3:hover a, h4:hover a { visibility: visible}
 
+/* seaarchBox */
+.searchBox {
+    position: relative;
+    height: 100%;
+    display: flex;
+    align-items: center;
+}
+
+input[type="search"] {
+    height: 30px;
+    line-height: 30px;
+    box-sizing: border-box;
+    padding: 0 15px 0 30px;
+    border: 1px solid #e3e3e3;
+    color: #ffffff;
+    outline: none;
+    border-radius: 15px;
+    margin-right: 10px;
+    transition: border-color 0.2s ease;
+    background-color: transparent;
+    background-size: 15px;
+    vertical-align: middle !important;
+}
+
+.searchbtn {
+	position: absolute;
+	font-size: 15px;
+	color: #66757f;
+	background-color: transparent;
+	border:none;
+	left: 2%;
+	top: 4px;
+	outline: none;
+	padding: 4px;
+}
+
+input[type="search"]:focus {
+    border-color: #42b983;
+    background-color: #fff;
+    color: #273849;
+}
+
+input[type="search"]::placeholder { /* Chrome, Firefox, Opera, Safari 10.1+ */
+    color: #fff;
+  }
+
 /* SideMenu Collapse */
+.docs-menu{
+    text-transform: capitalize;
+}
+
 .menuinput {
     display: none;
 }
 
-.menulabel-thanos {
+.menulabel-docs {
     cursor: pointer;
     display: flex;
     align-items: center;
@@ -94,7 +144,7 @@ h1:hover a, h2:hover a, h3:hover a, h4:hover a { visibility: visible}
     transform: rotateX(180deg);
 }
 
-.sidemenu-thanos .list-group {
+.sidemenu-docs .list-group {
     transform: scaleY(0);
     height: 0;
 }
@@ -102,4 +152,19 @@ h1:hover a, h2:hover a, h3:hover a, h4:hover a { visibility: visible}
 .menuinput:checked ~ .list-group {
     transform: scaleY(1);
     height: auto;
+}
+
+@media (max-width: 990px){
+    .searchbtn {
+        top: 0px;
+        left: 1%;
+    }
+
+    /* navbar toggle icon */
+    .fa-bars{
+        display: inline-block;
+        height: 1em;
+        vertical-align: middle;
+        width: 1em;
+    }
 }

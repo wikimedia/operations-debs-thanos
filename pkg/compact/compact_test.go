@@ -50,6 +50,8 @@ func TestRetryMultiError(t *testing.T) {
 	errs = terrors.MultiError{retryErr}
 	testutil.Assert(t, IsRetryError(errs), "if all errors are retriable this should return true")
 
+	testutil.Assert(t, IsRetryError(errors.Wrap(errs, "wrap")), "retry error with wrap")
+
 	errs = terrors.MultiError{nonRetryErr, retryErr}
 	testutil.Assert(t, !IsRetryError(errs), "mixed errors should return false")
 }
@@ -103,7 +105,7 @@ func TestGroupKey(t *testing.T) {
 		},
 	} {
 		if ok := t.Run("", func(t *testing.T) {
-			testutil.Equals(t, tcase.expected, GroupKey(tcase.input))
+			testutil.Equals(t, tcase.expected, DefaultGroupKey(tcase.input))
 		}); !ok {
 			return
 		}

@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"net/http"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -25,10 +26,13 @@ import (
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/rules"
-	tsdb "github.com/prometheus/prometheus/tsdb"
+	"github.com/prometheus/prometheus/tsdb"
 	tsdberrors "github.com/prometheus/prometheus/tsdb/errors"
 	"github.com/prometheus/prometheus/util/strutil"
+	"gopkg.in/alecthomas/kingpin.v2"
+
 	"github.com/thanos-io/thanos/pkg/alert"
+	v1 "github.com/thanos-io/thanos/pkg/api/rule"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 	"github.com/thanos-io/thanos/pkg/component"
 	"github.com/thanos-io/thanos/pkg/discovery/dns"
@@ -36,12 +40,12 @@ import (
 	"github.com/thanos-io/thanos/pkg/extprom"
 	extpromhttp "github.com/thanos-io/thanos/pkg/extprom/http"
 	http_util "github.com/thanos-io/thanos/pkg/http"
+	"github.com/thanos-io/thanos/pkg/logging"
 	"github.com/thanos-io/thanos/pkg/objstore/client"
 	"github.com/thanos-io/thanos/pkg/prober"
 	"github.com/thanos-io/thanos/pkg/promclient"
 	"github.com/thanos-io/thanos/pkg/query"
-	thanosrule "github.com/thanos-io/thanos/pkg/rule"
-	v1 "github.com/thanos-io/thanos/pkg/rule/api"
+	thanosrules "github.com/thanos-io/thanos/pkg/rules"
 	"github.com/thanos-io/thanos/pkg/runutil"
 	grpcserver "github.com/thanos-io/thanos/pkg/server/grpc"
 	httpserver "github.com/thanos-io/thanos/pkg/server/http"
@@ -51,7 +55,6 @@ import (
 	"github.com/thanos-io/thanos/pkg/tls"
 	"github.com/thanos-io/thanos/pkg/tracing"
 	"github.com/thanos-io/thanos/pkg/ui"
-	"gopkg.in/alecthomas/kingpin.v2"
 )
 
 // registerRule registers a rule command.
@@ -77,13 +80,13 @@ func registerRule(m map[string]setupFunc, app *kingpin.Application) {
 		Default("2h"))
 	tsdbRetention := modelDuration(cmd.Flag("tsdb.retention", "Block retention time on local disk.").
 		Default("48h"))
-
+	noLockFile := cmd.Flag("tsdb.no-lockfile", "Do not create lockfile in TSDB data directory. In any case, the lockfiles will be deleted on next startup.").Default("false").Bool()
 	walCompression := cmd.Flag("tsdb.wal-compression", "Compress the tsdb WAL.").Default("true").Bool()
 
 	alertmgrs := cmd.Flag("alertmanagers.url", "Alertmanager replica URLs to push firing alerts. Ruler claims success if push to at least one alertmanager from discovered succeeds. The scheme should not be empty e.g `http` might be used. The scheme may be prefixed with 'dns+' or 'dnssrv+' to detect Alertmanager IPs through respective DNS lookups. The port defaults to 9093 or the SRV record's value. The URL path is used as a prefix for the regular Alertmanager API path.").
 		Strings()
 	alertmgrsTimeout := cmd.Flag("alertmanagers.send-timeout", "Timeout for sending alerts to Alertmanager").Default("10s").Duration()
-	alertmgrsConfig := extflag.RegisterPathOrContent(cmd, "alertmanagers.config", "YAML file that contains alerting configuration. See format details: https://thanos.io/components/rule.md/#configuration. If defined, it takes precedence over the '--alertmanagers.url' and '--alertmanagers.send-timeout' flags.", false)
+	alertmgrsConfig := extflag.RegisterPathOrContent(cmd, "alertmanagers.config", "YAML file that contains alerting configuration. See format details: https://thanos.io/tip/components/rule.md/#configuration. If defined, it takes precedence over the '--alertmanagers.url' and '--alertmanagers.send-timeout' flags.", false)
 	alertmgrsDNSSDInterval := modelDuration(cmd.Flag("alertmanagers.sd-dns-interval", "Interval between DNS resolutions of Alertmanager hosts.").
 		Default("30s"))
 
@@ -95,12 +98,14 @@ func registerRule(m map[string]setupFunc, app *kingpin.Application) {
 	webExternalPrefix := cmd.Flag("web.external-prefix", "Static prefix for all HTML links and redirect URLs in the UI query web interface. Actual endpoints are still served on / or the web.route-prefix. This allows thanos UI to be served behind a reverse proxy that strips a URL sub-path.").Default("").String()
 	webPrefixHeaderName := cmd.Flag("web.prefix-header", "Name of HTTP request header used for dynamic prefixing of UI links and redirects. This option is ignored if web.external-prefix argument is set. Security risk: enable this option only if a reverse proxy in front of thanos is resetting the header. The --web.prefix-header=X-Forwarded-Prefix option can be useful, for example, if Thanos UI is served via Traefik reverse proxy with PathPrefixStrip option enabled, which sends the stripped prefix value in X-Forwarded-Prefix header. This allows thanos UI to be served on a sub-path.").Default("").String()
 
+	requestLoggingDecision := cmd.Flag("log.request.decision", "Request Logging for logging the start and end of requests. LogFinishCall is enabled by default. LogFinishCall : Logs the finish call of the requests. LogStartAndFinishCall : Logs the start and finish call of the requests. NoLogCall : Disable request logging.").Default("LogFinishCall").Enum("NoLogCall", "LogFinishCall", "LogStartAndFinishCall")
+
 	objStoreConfig := regCommonObjStoreFlags(cmd, "", false)
 
 	queries := cmd.Flag("query", "Addresses of statically configured query API servers (repeatable). The scheme may be prefixed with 'dns+' or 'dnssrv+' to detect query API servers through respective DNS lookups.").
 		PlaceHolder("<query>").Strings()
 
-	queryConfig := extflag.RegisterPathOrContent(cmd, "query.config", "YAML file that contains query API servers configuration. See format details: https://thanos.io/components/rule.md/#configuration. If defined, it takes precedence over the '--query' and '--query.sd-files' flags.", false)
+	queryConfig := extflag.RegisterPathOrContent(cmd, "query.config", "YAML file that contains query API servers configuration. See format details: https://thanos.io/tip/components/rule.md/#configuration. If defined, it takes precedence over the '--query' and '--query.sd-files' flags.", false)
 
 	fileSDFiles := cmd.Flag("query.sd-files", "Path to file that contains addresses of query API servers. The path can be a glob pattern (repeatable).").
 		PlaceHolder("<path>").Strings()
@@ -113,6 +118,12 @@ func registerRule(m map[string]setupFunc, app *kingpin.Application) {
 
 	dnsSDResolver := cmd.Flag("query.sd-dns-resolver", "Resolver to use. Possible options: [golang, miekgdns]").
 		Default("golang").Hidden().String()
+
+	allowOutOfOrderUpload := cmd.Flag("shipper.allow-out-of-order-uploads",
+		"If true, shipper will skip failed block uploads in the given iteration and retry later. This means that some newer blocks might be uploaded sooner than older blocks."+
+			"This can trigger compaction without those blocks and as a result will create an overlap situation. Set it to true if you have vertical compaction enabled and wish to upload blocks as soon as possible without caring"+
+			"about order.").
+		Default("false").Hidden().Bool()
 
 	m[comp.String()] = func(g *run.Group, logger log.Logger, reg *prometheus.Registry, tracer opentracing.Tracer, reload <-chan struct{}, _ bool) error {
 		lset, err := parseFlagLabels(*labelStrs)
@@ -128,7 +139,7 @@ func registerRule(m map[string]setupFunc, app *kingpin.Application) {
 			MinBlockDuration:  int64(time.Duration(*tsdbBlockDuration) / time.Millisecond),
 			MaxBlockDuration:  int64(time.Duration(*tsdbBlockDuration) / time.Millisecond),
 			RetentionDuration: int64(time.Duration(*tsdbRetention) / time.Millisecond),
-			NoLockfile:        true,
+			NoLockfile:        *noLockFile,
 			WALCompression:    *walCompression,
 		}
 
@@ -162,10 +173,13 @@ func registerRule(m map[string]setupFunc, app *kingpin.Application) {
 			return errors.New("--alertmanagers.url and --alertmanagers.config* parameters cannot be defined at the same time")
 		}
 
+		flagsMap := getFlagsMap(cmd.Model().Flags)
+
 		return runRule(g,
 			logger,
 			reg,
 			tracer,
+			*requestLoggingDecision,
 			reload,
 			lset,
 			*alertmgrs,
@@ -197,6 +211,8 @@ func registerRule(m map[string]setupFunc, app *kingpin.Application) {
 			time.Duration(*dnsSDInterval),
 			*dnsSDResolver,
 			comp,
+			*allowOutOfOrderUpload,
+			flagsMap,
 		)
 	}
 }
@@ -252,6 +268,7 @@ func runRule(
 	logger log.Logger,
 	reg *prometheus.Registry,
 	tracer opentracing.Tracer,
+	requestLoggingDecision string,
 	reloadSignal <-chan struct{},
 	lset labels.Labels,
 	alertmgrURLs []string,
@@ -283,6 +300,8 @@ func runRule(
 	dnsSDInterval time.Duration,
 	dnsSDResolver string,
 	comp component.Component,
+	allowOutOfOrderUpload bool,
+	flagsMap map[string]string,
 ) error {
 	metrics := newRuleMetrics(reg)
 
@@ -342,6 +361,12 @@ func runRule(
 	if err != nil {
 		return errors.Wrap(err, "open TSDB")
 	}
+
+	level.Debug(logger).Log("msg", "removing storage lock file if any")
+	if err := removeLockfileIfAny(logger, dataDir); err != nil {
+		return errors.Wrap(err, "remove storage lock files")
+	}
+
 	{
 		done := make(chan struct{})
 		g.Add(func() error {
@@ -397,13 +422,13 @@ func runRule(
 		alertmgrs = append(alertmgrs, alert.NewAlertmanager(logger, amClient, time.Duration(cfg.Timeout), cfg.APIVersion))
 	}
 
-	// Run rule evaluation and alert notifications.
 	var (
+		ruleMgr *thanosrules.Manager
 		alertQ  = alert.NewQueue(logger, reg, 10000, 100, labelsTSDBToProm(lset), alertExcludeLabels)
-		ruleMgr = thanosrule.NewManager(dataDir)
 	)
 	{
-		notify := func(ctx context.Context, expr string, alerts ...*rules.Alert) {
+		// Run rule evaluation and alert notifications.
+		notifyFunc := func(ctx context.Context, expr string, alerts ...*rules.Alert) {
 			res := make([]*alert.Alert, 0, len(alerts))
 			for _, alrt := range alerts {
 				// Only send actually firing alerts.
@@ -425,41 +450,35 @@ func runRule(
 			}
 			alertQ.Push(res)
 		}
-		st := db
 
-		opts := rules.ManagerOptions{
-			NotifyFunc:  notify,
-			Logger:      log.With(logger, "component", "rules"),
-			Appendable:  st,
-			ExternalURL: nil,
-			TSDB:        st,
-			ResendDelay: resendDelay,
-		}
+		ctx, cancel := context.WithCancel(context.Background())
+		logger = log.With(logger, "component", "rules")
+		ruleMgr = thanosrules.NewManager(
+			tracing.ContextWithTracer(ctx, tracer),
+			reg,
+			dataDir,
+			rules.ManagerOptions{
+				NotifyFunc:  notifyFunc,
+				Logger:      logger,
+				Appendable:  db,
+				ExternalURL: nil,
+				Queryable:   db,
+				ResendDelay: resendDelay,
+			},
+			queryFuncCreator(logger, queryClients, metrics.duplicatedQuery, metrics.ruleEvalWarnings),
+			lset,
+		)
 
-		// TODO(bwplotka): Hide this behind thanos rules.Manager.
-		for _, strategy := range storepb.PartialResponseStrategy_value {
-			s := storepb.PartialResponseStrategy(strategy)
+		// Schedule rule manager that evaluates rules.
+		g.Add(func() error {
+			ruleMgr.Run()
+			<-ctx.Done()
 
-			ctx, cancel := context.WithCancel(context.Background())
-			ctx = tracing.ContextWithTracer(ctx, tracer)
-
-			opts := opts
-			opts.Registerer = extprom.WrapRegistererWith(prometheus.Labels{"strategy": strings.ToLower(s.String())}, reg)
-			opts.Context = ctx
-			opts.QueryFunc = queryFunc(logger, queryClients, metrics.duplicatedQuery, metrics.ruleEvalWarnings, s)
-
-			mgr := rules.NewManager(&opts)
-			ruleMgr.SetRuleManager(s, mgr)
-			g.Add(func() error {
-				mgr.Run()
-				<-ctx.Done()
-
-				return nil
-			}, func(error) {
-				cancel()
-				mgr.Stop()
-			})
-		}
+			return nil
+		}, func(err error) {
+			cancel()
+			ruleMgr.Stop()
+		})
 	}
 	// Run the alert sender.
 	{
@@ -532,7 +551,8 @@ func runRule(
 			return errors.Wrap(err, "setup gRPC server")
 		}
 
-		s := grpcserver.New(logger, reg, tracer, comp, grpcProbe, store,
+		// TODO: Add rules API implementation when ready.
+		s := grpcserver.New(logger, reg, tracer, comp, grpcProbe, store, ruleMgr,
 			grpcserver.WithListen(grpcBindAddr),
 			grpcserver.WithGracePeriod(grpcGracePeriod),
 			grpcserver.WithTLSConfig(tlsCfg),
@@ -571,11 +591,17 @@ func runRule(
 
 		ins := extpromhttp.NewInstrumentationMiddleware(reg)
 
+		// Configure Request Logging for HTTP calls.
+		opts := []logging.Option{logging.WithDecider(func() logging.Decision {
+			return logging.LogDecision[requestLoggingDecision]
+		})}
+		logMiddleware := logging.NewHTTPServerMiddleware(logger, opts...)
+
 		// TODO(bplotka in PR #513 review): pass all flags, not only the flags needed by prefix rewriting.
 		ui.NewRuleUI(logger, reg, ruleMgr, alertQueryURL.String(), webExternalPrefix, webPrefixHeaderName).Register(router, ins)
 
-		api := v1.NewAPI(logger, reg, ruleMgr)
-		api.Register(router.WithPrefix("/api/v1"), tracer, logger, ins)
+		api := v1.NewRuleAPI(logger, reg, thanosrules.NewGRPCClient(ruleMgr), ruleMgr, flagsMap)
+		api.Register(router.WithPrefix("/api/v1"), tracer, logger, ins, logMiddleware)
 
 		srv := httpserver.New(logger, reg, comp, httpProbe,
 			httpserver.WithListen(httpBindAddr),
@@ -615,7 +641,7 @@ func runRule(
 			}
 		}()
 
-		s := shipper.New(logger, reg, dataDir, bkt, func() labels.Labels { return lset }, metadata.RulerSource)
+		s := shipper.New(logger, reg, dataDir, bkt, func() labels.Labels { return lset }, metadata.RulerSource, false, allowOutOfOrderUpload)
 
 		ctx, cancel := context.WithCancel(context.Background())
 
@@ -636,6 +662,21 @@ func runRule(
 	}
 
 	level.Info(logger).Log("msg", "starting rule node")
+	return nil
+}
+
+func removeLockfileIfAny(logger log.Logger, dataDir string) error {
+	absdir, err := filepath.Abs(dataDir)
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(filepath.Join(absdir, "lock")); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	level.Info(logger).Log("msg", "a leftover lockfile found and removed")
 	return nil
 }
 
@@ -683,57 +724,59 @@ func removeDuplicateQueryEndpoints(logger log.Logger, duplicatedQueriers prometh
 	return deduplicated
 }
 
-// queryFunc returns query function that hits the HTTP query API of query peers in randomized order until we get a result
-// back or the context get canceled.
-func queryFunc(
+func queryFuncCreator(
 	logger log.Logger,
 	queriers []*http_util.Client,
 	duplicatedQuery prometheus.Counter,
 	ruleEvalWarnings *prometheus.CounterVec,
-	partialResponseStrategy storepb.PartialResponseStrategy,
-) rules.QueryFunc {
-	var spanID string
+) func(partialResponseStrategy storepb.PartialResponseStrategy) rules.QueryFunc {
 
-	switch partialResponseStrategy {
-	case storepb.PartialResponseStrategy_WARN:
-		spanID = "/rule_instant_query HTTP[client]"
-	case storepb.PartialResponseStrategy_ABORT:
-		spanID = "/rule_instant_query_part_resp_abort HTTP[client]"
-	default:
-		// Programming error will be caught by tests.
-		panic(errors.Errorf("unknown partial response strategy %v", partialResponseStrategy).Error())
-	}
+	// queryFunc returns query function that hits the HTTP query API of query peers in randomized order until we get a result
+	// back or the context get canceled.
+	return func(partialResponseStrategy storepb.PartialResponseStrategy) rules.QueryFunc {
+		var spanID string
 
-	promClients := make([]*promclient.Client, 0, len(queriers))
-	for _, q := range queriers {
-		promClients = append(promClients, promclient.NewClient(logger, q))
-	}
+		switch partialResponseStrategy {
+		case storepb.PartialResponseStrategy_WARN:
+			spanID = "/rule_instant_query HTTP[client]"
+		case storepb.PartialResponseStrategy_ABORT:
+			spanID = "/rule_instant_query_part_resp_abort HTTP[client]"
+		default:
+			// Programming error will be caught by tests.
+			panic(errors.Errorf("unknown partial response strategy %v", partialResponseStrategy).Error())
+		}
 
-	return func(ctx context.Context, q string, t time.Time) (v promql.Vector, err error) {
-		for _, i := range rand.Perm(len(queriers)) {
-			promClient := promClients[i]
-			endpoints := removeDuplicateQueryEndpoints(logger, duplicatedQuery, queriers[i].Endpoints())
-			for _, i := range rand.Perm(len(endpoints)) {
-				var warns []string
-				tracing.DoInSpan(ctx, spanID, func(ctx context.Context) {
-					v, warns, err = promClient.PromqlQueryInstant(ctx, endpoints[i], q, t, promclient.QueryOptions{
+		promClients := make([]*promclient.Client, 0, len(queriers))
+		for _, q := range queriers {
+			promClients = append(promClients, promclient.NewClient(q, logger, "thanos-rule"))
+		}
+
+		return func(ctx context.Context, q string, t time.Time) (promql.Vector, error) {
+			for _, i := range rand.Perm(len(queriers)) {
+				promClient := promClients[i]
+				endpoints := removeDuplicateQueryEndpoints(logger, duplicatedQuery, queriers[i].Endpoints())
+				for _, i := range rand.Perm(len(endpoints)) {
+					span, ctx := tracing.StartSpan(ctx, spanID)
+					v, warns, err := promClient.PromqlQueryInstant(ctx, endpoints[i], q, t, promclient.QueryOptions{
 						Deduplicate:             true,
 						PartialResponseStrategy: partialResponseStrategy,
 					})
-				})
-				if err != nil {
-					level.Error(logger).Log("err", err, "query", q)
-					continue
+					span.Finish()
+
+					if err != nil {
+						level.Error(logger).Log("err", err, "query", q)
+						continue
+					}
+					if len(warns) > 0 {
+						ruleEvalWarnings.WithLabelValues(strings.ToLower(partialResponseStrategy.String())).Inc()
+						// TODO(bwplotka): Propagate those to UI, probably requires changing rule manager code ):
+						level.Warn(logger).Log("warnings", strings.Join(warns, ", "), "query", q)
+					}
+					return v, nil
 				}
-				if len(warns) > 0 {
-					ruleEvalWarnings.WithLabelValues(strings.ToLower(partialResponseStrategy.String())).Inc()
-					// TODO(bwplotka): Propagate those to UI, probably requires changing rule manager code ):
-					level.Warn(logger).Log("warnings", strings.Join(warns, ", "), "query", q)
-				}
-				return v, nil
 			}
+			return nil, errors.Errorf("no query API server reachable")
 		}
-		return nil, errors.New("no query API server reachable")
 	}
 }
 
@@ -757,7 +800,7 @@ func addDiscoveryGroups(g *run.Group, c *http_util.Client, interval time.Duratio
 
 func reloadRules(logger log.Logger,
 	ruleFiles []string,
-	ruleMgr *thanosrule.Manager,
+	ruleMgr *thanosrules.Manager,
 	evalInterval time.Duration,
 	metrics *RuleMetrics) error {
 	level.Debug(logger).Log("msg", "configured rule files", "files", strings.Join(ruleFiles, ","))
@@ -796,7 +839,7 @@ func reloadRules(logger log.Logger,
 
 	metrics.rulesLoaded.Reset()
 	for _, group := range ruleMgr.RuleGroups() {
-		metrics.rulesLoaded.WithLabelValues(group.PartialResponseStrategy.String(), group.File(), group.Name()).Set(float64(len(group.Rules())))
+		metrics.rulesLoaded.WithLabelValues(group.PartialResponseStrategy.String(), group.OriginalFile, group.Name()).Set(float64(len(group.Rules())))
 	}
 	return errs.Err()
 }

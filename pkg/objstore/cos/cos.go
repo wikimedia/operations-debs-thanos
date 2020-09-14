@@ -9,14 +9,15 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-kit/kit/log"
 	"github.com/mozillazg/go-cos"
 	"github.com/pkg/errors"
 	"github.com/thanos-io/thanos/pkg/objstore"
+	"github.com/thanos-io/thanos/pkg/objstore/clientutil"
 	"github.com/thanos-io/thanos/pkg/runutil"
 	"gopkg.in/yaml.v2"
 )
@@ -93,23 +94,29 @@ func (b *Bucket) Name() string {
 	return b.name
 }
 
-// ObjectSize returns the size of the specified object.
-func (b *Bucket) ObjectSize(ctx context.Context, name string) (uint64, error) {
+// Attributes returns information about the specified object.
+func (b *Bucket) Attributes(ctx context.Context, name string) (objstore.ObjectAttributes, error) {
 	resp, err := b.client.Object.Head(ctx, name, nil)
 	if err != nil {
-		return 0, err
+		return objstore.ObjectAttributes{}, err
 	}
-	if v, ok := resp.Header["Content-Length"]; ok {
-		if len(v) == 0 {
-			return 0, errors.New("content-length header has no values")
-		}
-		ret, err := strconv.ParseUint(v[0], 10, 64)
-		if err != nil {
-			return 0, errors.Wrap(err, "convert content-length")
-		}
-		return ret, nil
+
+	size, err := clientutil.ParseContentLength(resp.Header)
+	if err != nil {
+		return objstore.ObjectAttributes{}, err
 	}
-	return 0, errors.New("content-length header not found")
+
+	// tencent cos return Last-Modified header in RFC1123 format.
+	// see api doc for details: https://intl.cloud.tencent.com/document/product/436/7729
+	mod, err := clientutil.ParseLastModified(resp.Header, time.RFC1123)
+	if err != nil {
+		return objstore.ObjectAttributes{}, err
+	}
+
+	return objstore.ObjectAttributes{
+		Size:         size,
+		LastModified: mod,
+	}, nil
 }
 
 // Upload the contents of the reader as an object into the bucket.

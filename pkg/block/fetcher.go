@@ -31,6 +31,7 @@ import (
 	"github.com/thanos-io/thanos/pkg/objstore"
 	"github.com/thanos-io/thanos/pkg/runutil"
 	"golang.org/x/sync/errgroup"
+	"gopkg.in/yaml.v2"
 )
 
 type fetcherMetrics struct {
@@ -525,14 +526,14 @@ func NewLabelShardedMetaFilter(relabelConfig []*relabel.Config) *LabelShardedMet
 }
 
 // Special label that will have an ULID of the meta.json being referenced to.
-const blockIDLabel = "__block_id"
+const BlockIDLabel = "__block_id"
 
 // Filter filters out blocks that have no labels after relabelling of each block external (Thanos) labels.
 func (f *LabelShardedMetaFilter) Filter(_ context.Context, metas map[ulid.ULID]*metadata.Meta, synced *extprom.TxGaugeVec) error {
 	var lbls labels.Labels
 	for id, m := range metas {
 		lbls = lbls[:0]
-		lbls = append(lbls, labels.Label{Name: blockIDLabel, Value: id.String()})
+		lbls = append(lbls, labels.Label{Name: BlockIDLabel, Value: id.String()})
 		for k, v := range m.Thanos.Labels {
 			lbls = append(lbls, labels.Label{Name: k, Value: v})
 		}
@@ -682,6 +683,10 @@ func NewReplicaLabelRemover(logger log.Logger, replicaLabels []string) *ReplicaL
 
 // Modify modifies external labels of existing blocks, it removes given replica labels from the metadata of blocks that have it.
 func (r *ReplicaLabelRemover) Modify(_ context.Context, metas map[ulid.ULID]*metadata.Meta, modified *extprom.TxGaugeVec) error {
+	if len(r.replicaLabels) == 0 {
+		return nil
+	}
+
 	for u, meta := range metas {
 		l := meta.Thanos.Labels
 		for _, replicaLabel := range r.replicaLabels {
@@ -794,4 +799,21 @@ func (f *IgnoreDeletionMarkFilter) Filter(ctx context.Context, metas map[ulid.UL
 		}
 	}
 	return nil
+}
+
+// ParseRelabelConfig parses relabel configuration.
+func ParseRelabelConfig(contentYaml []byte) ([]*relabel.Config, error) {
+	var relabelConfig []*relabel.Config
+	if err := yaml.Unmarshal(contentYaml, &relabelConfig); err != nil {
+		return nil, errors.Wrap(err, "parsing relabel configuration")
+	}
+	supportedActions := map[relabel.Action]struct{}{relabel.Keep: {}, relabel.Drop: {}, relabel.HashMod: {}}
+
+	for _, cfg := range relabelConfig {
+		if _, ok := supportedActions[cfg.Action]; !ok {
+			return nil, errors.Errorf("unsupported relabel action: %v", cfg.Action)
+		}
+	}
+
+	return relabelConfig, nil
 }

@@ -44,12 +44,12 @@ Flags:
       --tracing.config-file=<file-path>
                                  Path to YAML file with tracing configuration.
                                  See format details:
-                                 https://thanos.io/tracing.md/#configuration
+                                 https://thanos.io/tip/tracing.md/#configuration
       --tracing.config=<content>
                                  Alternative to 'tracing.config-file' flag
                                  (lower priority). Content of YAML file with
                                  tracing configuration. See format details:
-                                 https://thanos.io/tracing.md/#configuration
+                                 https://thanos.io/tip/tracing.md/#configuration
       --http-address="0.0.0.0:10902"
                                  Listen host:port for HTTP endpoints.
       --http-grace-period=2m     Time to wait after an interrupt received for
@@ -81,35 +81,38 @@ Flags:
       --index-cache.config-file=<file-path>
                                  Path to YAML file that contains index cache
                                  configuration. See format details:
-                                 https://thanos.io/components/store.md/#index-cache
+                                 https://thanos.io/tip/components/store.md/#index-cache
       --index-cache.config=<content>
                                  Alternative to 'index-cache.config-file' flag
                                  (lower priority). Content of YAML file that
                                  contains index cache configuration. See format
                                  details:
-                                 https://thanos.io/components/store.md/#index-cache
+                                 https://thanos.io/tip/components/store.md/#index-cache
       --chunk-pool-size=2GB      Maximum size of concurrently allocatable bytes
                                  reserved strictly to reuse for chunks in
                                  memory.
       --store.grpc.series-sample-limit=0
                                  Maximum amount of samples returned via a single
-                                 Series call. 0 means no limit. NOTE: For
-                                 efficiency we take 120 as the number of samples
-                                 in chunk (it cannot be bigger than that), so
-                                 the actual number of samples might be lower,
-                                 even though the maximum could be hit.
+                                 Series call. The Series call fails if this
+                                 limit is exceeded. 0 means no limit. NOTE: For
+                                 efficiency the limit is internally implemented
+                                 as 'chunks limit' considering each chunk
+                                 contains 120 samples (it's the max number of
+                                 samples each chunk can contain), so the actual
+                                 number of samples might be lower, even though
+                                 the maximum could be hit.
       --store.grpc.series-max-concurrency=20
                                  Maximum number of concurrent Series calls.
       --objstore.config-file=<file-path>
                                  Path to YAML file that contains object store
                                  configuration. See format details:
-                                 https://thanos.io/storage.md/#configuration
+                                 https://thanos.io/tip/thanos/storage.md/#configuration
       --objstore.config=<content>
                                  Alternative to 'objstore.config-file' flag
                                  (lower priority). Content of YAML file that
                                  contains object store configuration. See format
                                  details:
-                                 https://thanos.io/storage.md/#configuration
+                                 https://thanos.io/tip/thanos/storage.md/#configuration
       --sync-block-duration=3m   Repeat interval for syncing the blocks between
                                  local and remote view.
       --block-sync-concurrency=20
@@ -229,8 +232,7 @@ The `in-memory` index cache is enabled by default and its max size can be config
 
 Alternatively, the `in-memory` index cache can also by configured using `--index-cache.config-file` to reference to the configuration file or `--index-cache.config` to put yaml config directly:
 
-[embedmd]: # "../flags/config_index_cache_in_memory.txt yaml"
-
+[embedmd]:# (../flags/config_index_cache_in_memory.txt yaml)
 ```yaml
 type: IN-MEMORY
 config:
@@ -247,8 +249,7 @@ All the settings are **optional**:
 
 The `memcached` index cache allows to use [Memcached](https://memcached.org) as cache backend. This cache type is configured using `--index-cache.config-file` to reference to the configuration file or `--index-cache.config` to put yaml config directly:
 
-[embedmd]: # "../flags/config_index_cache_memcached.txt yaml"
-
+[embedmd]:# (../flags/config_index_cache_memcached.txt yaml)
 ```yaml
 type: MEMCACHED
 config:
@@ -257,8 +258,8 @@ config:
   max_idle_connections: 0
   max_async_concurrency: 0
   max_async_buffer_size: 0
-  max_item_size: 1MiB
   max_get_multi_concurrency: 0
+  max_item_size: 0
   max_get_multi_batch_size: 0
   dns_provider_update_interval: 0s
 ```
@@ -285,14 +286,14 @@ Thanos Store Gateway supports a "caching bucket" with chunks and metadata cachin
 Currently only memcached "backend" is supported:
 
 ```yaml
-type: memcached
+type: MEMCACHED # Case-insensitive
 config:
   addresses:
     - localhost:11211
 
 chunk_subrange_size: 16000
 max_chunks_get_range_requests: 3
-chunk_object_size_ttl: 24h
+chunk_object_attrs_ttl: 24h
 chunk_subrange_ttl: 24h
 blocks_iter_ttl: 5m
 metafile_exists_ttl: 2h
@@ -307,7 +308,7 @@ Additional options to configure various aspects of chunks cache are available:
 
 - `chunk_subrange_size`: size of segment of chunks object that is stored to the cache. This is the smallest unit that chunks cache is working with.
 - `max_chunks_get_range_requests`: how many "get range" sub-requests may cache perform to fetch missing subranges.
-- `chunk_object_size_ttl`: how long to keep information about chunk file length in the cache.
+- `chunk_object_attrs_ttl`: how long to keep information about chunk file attributes (e.g. size) in the cache.
 - `chunk_subrange_ttl`: how long to keep individual subranges in the cache.
 
 Following options are used for metadata caching (meta.json files, deletion mark files, iteration result):
@@ -322,58 +323,6 @@ Note that chunks and metadata cache is an experimental feature, and these fields
 
 ## Index Header
 
-In order to query series inside blocks from object storage, Store Gateway has to know certain initial info about each block such as:
+In order to query series inside blocks from object storage, Store Gateway has to know certain initial info from each block index. In order to achieve so, on startup the Gateway builds an `index-header` for each block and stores it on local disk; such `index-header` is build downloading specific pieces of original block's index, stored on local disk and then mmaped and used by Store Gateway.
 
-- symbols table to unintern string values
-- postings offset for posting lookup
-
-In order to achieve so, on startup for each block `index-header` is built from pieces of original block's index and stored on disk.
-Such `index-header` file is then mmaped and used by Store Gateway.
-
-### Format (version 1)
-
-The following describes the format of the `index-header` file found in each block store gateway local directory.
-It is terminated by a table of contents which serves as an entry point into the index.
-
-```
-┌─────────────────────────────┬───────────────────────────────┐
-│    magic(0xBAAAD792) <4b>   │      version(1) <1 byte>      │
-├─────────────────────────────┬───────────────────────────────┤
-│  index version(2) <1 byte>  │ index PostingOffsetTable <8b> │
-├─────────────────────────────┴───────────────────────────────┤
-│ ┌─────────────────────────────────────────────────────────┐ │
-│ │      Symbol Table (exact copy from original index)      │ │
-│ ├─────────────────────────────────────────────────────────┤ │
-│ │      Posting Offset Table (exact copy from index)       │ │
-│ ├─────────────────────────────────────────────────────────┤ │
-│ │                          TOC                            │ │
-│ └─────────────────────────────────────────────────────────┘ │
-└─────────────────────────────────────────────────────────────┘
-```
-
-When the index is written, an arbitrary number of padding bytes may be added between the lined out main sections above. When sequentially scanning through the file, any zero bytes after a section's specified length must be skipped.
-
-Most of the sections described below start with a `len` field. It always specifies the number of bytes just before the trailing CRC32 checksum. The checksum is always calculated over those `len` bytes.
-
-### Symbol Table
-
-See [Symbols](https://github.com/prometheus/prometheus/blob/d782387f814753b0118d402ec8cdbdef01bf9079/tsdb/docs/format/index.md#symbol-table)
-
-### Postings Offset Table
-
-See [Posting Offset Table](https://github.com/prometheus/prometheus/blob/d782387f814753b0118d402ec8cdbdef01bf9079/tsdb/docs/format/index.md#postings-offset-table)
-
-### TOC
-
-The table of contents serves as an entry point to the entire index and points to various sections in the file.
-If a reference is zero, it indicates the respective section does not exist and empty results should be returned upon lookup.
-
-```
-┌─────────────────────────────────────────┐
-│ ref(symbols) <8b>                       │
-├─────────────────────────────────────────┤
-│ ref(postings offset table) <8b>         │
-├─────────────────────────────────────────┤
-│ CRC32 <4b>                              │
-└─────────────────────────────────────────┘
-```
+For more information, please refer to the [Binary index-header](../operating/binary-index-header.md) operational guide.

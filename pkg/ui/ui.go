@@ -34,6 +34,9 @@ var (
 		"/targets",
 		"/tsdb-status",
 		"/version",
+		"/stores",
+		"/blocks",
+		"/loaded",
 	}
 )
 
@@ -41,15 +44,16 @@ type BaseUI struct {
 	logger                       log.Logger
 	menuTmpl                     string
 	tmplFuncs                    template.FuncMap
+	tmplVariables                map[string]string
 	externalPrefix, prefixHeader string
 	component                    component.Component
 }
 
-func NewBaseUI(logger log.Logger, menuTmpl string, funcMap template.FuncMap, externalPrefix, prefixHeader string, component component.Component) *BaseUI {
+func NewBaseUI(logger log.Logger, menuTmpl string, funcMap template.FuncMap, tmplVariables map[string]string, externalPrefix, prefixHeader string, component component.Component) *BaseUI {
 	funcMap["pathPrefix"] = func() string { return "" }
 	funcMap["buildVersion"] = func() string { return version.Revision }
 
-	return &BaseUI{logger: logger, menuTmpl: menuTmpl, tmplFuncs: funcMap, externalPrefix: externalPrefix, prefixHeader: prefixHeader, component: component}
+	return &BaseUI{logger: logger, menuTmpl: menuTmpl, tmplFuncs: funcMap, tmplVariables: tmplVariables, externalPrefix: externalPrefix, prefixHeader: prefixHeader, component: component}
 }
 func (bu *BaseUI) serveStaticAsset(w http.ResponseWriter, req *http.Request) {
 	fp := route.Param(req.Context(), "filepath")
@@ -80,18 +84,14 @@ func (bu *BaseUI) serveReactIndex(index string, w http.ResponseWriter, req *http
 	prefix := GetWebPrefix(bu.logger, bu.externalPrefix, bu.prefixHeader, req)
 
 	tmpl, err := template.New("").Funcs(bu.tmplFuncs).
-		Funcs(template.FuncMap{"pathPrefix": func() string { return prefix }}).
+		Funcs(template.FuncMap{"pathPrefix": absolutePrefix(prefix)}).
 		Parse(string(file))
 
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	if err := tmpl.Execute(w, struct {
-		Component string
-	}{
-		Component: bu.component.String(),
-	}); err != nil {
+	if err := tmpl.Execute(w, bu.tmplVariables); err != nil {
 		level.Warn(bu.logger).Log("msg", "template expansion failed", "err", err)
 	}
 }
@@ -142,7 +142,7 @@ func (bu *BaseUI) executeTemplate(w http.ResponseWriter, name string, prefix str
 	}
 
 	t, err := template.New("").Funcs(bu.tmplFuncs).
-		Funcs(template.FuncMap{"pathPrefix": func() string { return prefix }}).
+		Funcs(template.FuncMap{"pathPrefix": absolutePrefix(prefix)}).
 		Parse(text)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -153,15 +153,24 @@ func (bu *BaseUI) executeTemplate(w http.ResponseWriter, name string, prefix str
 	}
 }
 
+func absolutePrefix(prefix string) func() string {
+	return func() string {
+		if prefix == "" {
+			return ""
+		}
+		return "/" + prefix
+	}
+}
+
 // GetWebPrefix sanitizes an external URL path prefix value.
 // A value provided by web.external-prefix flag is preferred over the one supplied through an HTTP header.
 func GetWebPrefix(logger log.Logger, externalPrefix, prefixHeader string, r *http.Request) string {
+	prefix := r.Header.Get(prefixHeader)
+
 	// Ignore web.prefix-header value if web.external-prefix is defined.
 	if len(externalPrefix) > 0 {
-		return externalPrefix
+		prefix = externalPrefix
 	}
-
-	prefix := r.Header.Get(prefixHeader)
 
 	// Even if rfc2616 suggests that Location header "value consists of a single absolute URI", browsers
 	// support relative location too. So for extra security, scheme and host parts are stripped from a dynamic prefix.
@@ -183,10 +192,7 @@ func SanitizePrefix(prefix string) (string, error) {
 
 	// Remove double slashes, convert to absolute path.
 	sanitizedPrefix := strings.TrimPrefix(path.Clean(u.Path), ".")
-
-	if strings.HasSuffix(sanitizedPrefix, "/") {
-		sanitizedPrefix = strings.TrimSuffix(sanitizedPrefix, "/")
-	}
+	sanitizedPrefix = strings.TrimSuffix(sanitizedPrefix, "/")
 
 	return sanitizedPrefix, nil
 }

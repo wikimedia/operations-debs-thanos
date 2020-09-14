@@ -22,6 +22,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/thanos-io/thanos/pkg/component"
+	"github.com/thanos-io/thanos/pkg/promclient"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
 	"github.com/thanos-io/thanos/pkg/strutil"
 	"github.com/thanos-io/thanos/pkg/tracing"
@@ -29,6 +30,11 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
+
+type ctxKey int
+
+// StoreMatcherKey is the context key for the store's allow list.
+const StoreMatcherKey = ctxKey(0)
 
 // Client holds meta information about a store.
 type Client interface {
@@ -99,7 +105,7 @@ func NewProxyStore(
 }
 
 // Info returns store information about the external labels this store have.
-func (s *ProxyStore) Info(ctx context.Context, r *storepb.InfoRequest) (*storepb.InfoResponse, error) {
+func (s *ProxyStore) Info(_ context.Context, _ *storepb.InfoRequest) (*storepb.InfoResponse, error) {
 	res := &storepb.InfoResponse{
 		Labels:    make([]storepb.Label, 0, len(s.selectorLabels)),
 		StoreType: s.component.ToProto(),
@@ -183,18 +189,23 @@ func mergeLabels(a []storepb.Label, b labels.Labels) []storepb.Label {
 	return res
 }
 
-type ctxRespSender struct {
+// cancelableRespSender is a response channel that does need to be exhausted on cancel.
+type cancelableRespSender struct {
 	ctx context.Context
 	ch  chan<- *storepb.SeriesResponse
 }
 
-func newRespCh(ctx context.Context, buffer int) (*ctxRespSender, <-chan *storepb.SeriesResponse, func()) {
+func newCancelableRespChannel(ctx context.Context, buffer int) (*cancelableRespSender, chan *storepb.SeriesResponse) {
 	respCh := make(chan *storepb.SeriesResponse, buffer)
-	return &ctxRespSender{ctx: ctx, ch: respCh}, respCh, func() { close(respCh) }
+	return &cancelableRespSender{ctx: ctx, ch: respCh}, respCh
 }
 
-func (s ctxRespSender) send(r *storepb.SeriesResponse) {
-	s.ch <- r
+// send or return on cancel.
+func (s cancelableRespSender) send(r *storepb.SeriesResponse) {
+	select {
+	case <-s.ctx.Done():
+	case s.ch <- r:
+	}
 }
 
 // Series returns all series for a requested time range and label matcher. Requested series are taken from other
@@ -212,15 +223,17 @@ func (s *ProxyStore) Series(r *storepb.SeriesRequest, srv storepb.Store_SeriesSe
 		return status.Error(codes.InvalidArgument, errors.New("no matchers specified (excluding external labels)").Error())
 	}
 
-	var (
-		g, gctx = errgroup.WithContext(srv.Context())
+	g, gctx := errgroup.WithContext(srv.Context())
 
-		// Allow to buffer max 10 series response.
-		// Each might be quite large (multi chunk long series given by sidecar).
-		respSender, respRecv, closeFn = newRespCh(gctx, 10)
-	)
+	// Allow to buffer max 10 series response.
+	// Each might be quite large (multi chunk long series given by sidecar).
+	respSender, respCh := newCancelableRespChannel(gctx, 10)
 
 	g.Go(func() error {
+		// This go routine is responsible for calling store's Series concurrently. Merged results
+		// are passed to respCh and sent concurrently to client (if buffer of 10 have room).
+		// When this go routine finishes or is canceled, respCh channel is closed.
+
 		var (
 			seriesSet      []storepb.SeriesSet
 			storeDebugMsgs []string
@@ -238,7 +251,7 @@ func (s *ProxyStore) Series(r *storepb.SeriesRequest, srv storepb.Store_SeriesSe
 
 		defer func() {
 			wg.Wait()
-			closeFn()
+			close(respCh)
 		}()
 
 		for _, st := range s.stores() {
@@ -247,8 +260,14 @@ func (s *ProxyStore) Series(r *storepb.SeriesRequest, srv storepb.Store_SeriesSe
 			// NOTE: all matchers are validated in matchesExternalLabels method so we explicitly ignore error.
 			var ok bool
 			tracing.DoInSpan(gctx, "store_matches", func(ctx context.Context) {
+				storeMatcher := [][]storepb.LabelMatcher{}
+				if ctxVal := srv.Context().Value(StoreMatcherKey); ctxVal != nil {
+					if value, ok := ctxVal.([][]storepb.LabelMatcher); ok {
+						storeMatcher = value
+					}
+				}
 				// We can skip error, we already translated matchers once.
-				ok, _ = storeMatches(st, r.MinTime, r.MaxTime, r.Matchers...)
+				ok, _ = storeMatches(st, r.MinTime, r.MaxTime, storeMatcher, r.Matchers...)
 			})
 			if !ok {
 				storeDebugMsgs = append(storeDebugMsgs, fmt.Sprintf("store %s filtered out", st))
@@ -293,6 +312,10 @@ func (s *ProxyStore) Series(r *storepb.SeriesRequest, srv storepb.Store_SeriesSe
 			return nil
 		}
 
+		// TODO(bwplotka): Currently we stream into big frames. Consider ensuring 1MB maximum.
+		// This however does not matter much when used with QueryAPI. Matters for federated Queries a lot.
+		// https://github.com/thanos-io/thanos/issues/2332
+		// Series are not necessarily merged across themselves.
 		mergedSet := storepb.MergeSeriesSets(seriesSet...)
 		for mergedSet.Next() {
 			var series storepb.Series
@@ -301,21 +324,25 @@ func (s *ProxyStore) Series(r *storepb.SeriesRequest, srv storepb.Store_SeriesSe
 		}
 		return mergedSet.Err()
 	})
-
-	for resp := range respRecv {
-		if err := srv.Send(resp); err != nil {
-			return status.Error(codes.Unknown, errors.Wrap(err, "send series response").Error())
+	g.Go(func() error {
+		// Go routine for gathering merged responses and sending them over to client. It stops when
+		// respCh channel is closed OR on error from client.
+		for resp := range respCh {
+			if err := srv.Send(resp); err != nil {
+				return status.Error(codes.Unknown, errors.Wrap(err, "send series response").Error())
+			}
 		}
-	}
-
+		return nil
+	})
 	if err := g.Wait(); err != nil {
+		// TODO(bwplotka): Replace with request logger.
 		level.Error(s.logger).Log("err", err)
 		return err
 	}
 	return nil
 }
 
-type warnSender interface {
+type directSender interface {
 	send(*storepb.SeriesResponse)
 }
 
@@ -326,7 +353,7 @@ type streamSeriesSet struct {
 	logger log.Logger
 
 	stream storepb.Store_SeriesClient
-	warnCh warnSender
+	warnCh directSender
 
 	currSeries *storepb.Series
 	recvCh     chan *storepb.Series
@@ -362,7 +389,7 @@ func startStreamSeriesSet(
 	closeSeries context.CancelFunc,
 	wg *sync.WaitGroup,
 	stream storepb.Store_SeriesClient,
-	warnCh warnSender,
+	warnCh directSender,
 	name string,
 	partialResponse bool,
 	responseTimeout time.Duration,
@@ -473,6 +500,7 @@ func (s *streamSeriesSet) At() ([]storepb.Label, []storepb.AggrChunk) {
 	}
 	return s.currSeries.Labels, s.currSeries.Chunks
 }
+
 func (s *streamSeriesSet) Err() error {
 	s.errMtx.Lock()
 	defer s.errMtx.Unlock()
@@ -481,12 +509,38 @@ func (s *streamSeriesSet) Err() error {
 
 // matchStore returns true if the given store may hold data for the given label
 // matchers.
-func storeMatches(s Client, mint, maxt int64, matchers ...storepb.LabelMatcher) (bool, error) {
+func storeMatches(s Client, mint, maxt int64, storeMatcher [][]storepb.LabelMatcher, matchers ...storepb.LabelMatcher) (bool, error) {
 	storeMinTime, storeMaxTime := s.TimeRange()
 	if mint > storeMaxTime || maxt < storeMinTime {
 		return false, nil
 	}
+	match, err := storeMatchMetadata(s, storeMatcher)
+	if err != nil || !match {
+		return match, err
+	}
 	return labelSetsMatch(s.LabelSets(), matchers)
+}
+
+// storeMatch return true if the store's metadata labels match the storeMatcher.
+func storeMatchMetadata(s Client, storeMatcher [][]storepb.LabelMatcher) (bool, error) {
+	clientLabels := generateMetadataClientLabels(s)
+	if len(storeMatcher) == 0 {
+		return true, nil
+	}
+	res := false
+	for _, stm := range storeMatcher {
+		stmMatch, err := labelSetMatches(clientLabels, stm)
+		if err != nil {
+			return false, err
+		}
+		res = res || stmMatch
+	}
+	return res, nil
+}
+
+func generateMetadataClientLabels(s Client) storepb.LabelSet {
+	l := storepb.Label{Name: "__address__", Value: s.Addr()}
+	return storepb.LabelSet{Labels: []storepb.Label{l}}
 }
 
 // labelSetsMatch returns false if all label-set do not match the matchers.
@@ -515,7 +569,7 @@ func labelSetMatches(ls storepb.LabelSet, matchers []storepb.LabelMatcher) (bool
 				continue
 			}
 
-			m, err := translateMatcher(m)
+			m, err := promclient.TranslateMatcher(m)
 			if err != nil {
 				return false, err
 			}
@@ -544,6 +598,8 @@ func (s *ProxyStore) LabelNames(ctx context.Context, r *storepb.LabelNamesReques
 		g.Go(func() error {
 			resp, err := st.LabelNames(gctx, &storepb.LabelNamesRequest{
 				PartialResponseDisabled: r.PartialResponseDisabled,
+				Start:                   r.Start,
+				End:                     r.End,
 			})
 			if err != nil {
 				err = errors.Wrapf(err, "fetch label names from store %s", st)
@@ -593,6 +649,8 @@ func (s *ProxyStore) LabelValues(ctx context.Context, r *storepb.LabelValuesRequ
 			resp, err := store.LabelValues(gctx, &storepb.LabelValuesRequest{
 				Label:                   r.Label,
 				PartialResponseDisabled: r.PartialResponseDisabled,
+				Start:                   r.Start,
+				End:                     r.End,
 			})
 			if err != nil {
 				err = errors.Wrapf(err, "fetch label values from store %s", store)

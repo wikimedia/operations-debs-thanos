@@ -62,10 +62,11 @@ func main() {
 	registerCompact(cmds, app)
 	registerTools(cmds, app)
 	registerReceive(cmds, app)
+	registerQueryFrontend(cmds, app)
 
 	cmd, err := app.Parse(os.Args[1:])
 	if err != nil {
-		fmt.Fprintln(os.Stderr, errors.Wrapf(err, "Error parsing commandline arguments"))
+		fmt.Fprintln(os.Stderr, errors.Wrapf(err, "Error parsing commandline arguments: %v", os.Args))
 		app.Usage(os.Args[1:])
 		os.Exit(2)
 	}
@@ -242,4 +243,20 @@ func reload(logger log.Logger, cancel <-chan struct{}, r chan<- struct{}) error 
 			return errors.New("canceled")
 		}
 	}
+}
+
+func getFlagsMap(flags []*kingpin.FlagModel) map[string]string {
+	flagsMap := map[string]string{}
+
+	// Exclude kingpin default flags to expose only Thanos ones.
+	boilerplateFlags := kingpin.New("", "").Version("")
+
+	for _, f := range flags {
+		if boilerplateFlags.GetFlag(f.Name) != nil {
+			continue
+		}
+		flagsMap[f.Name] = f.Value.String()
+	}
+
+	return flagsMap
 }

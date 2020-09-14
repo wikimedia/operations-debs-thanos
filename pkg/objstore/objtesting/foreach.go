@@ -74,7 +74,7 @@ func ForeachStore(t *testing.T, testFn func(t *testing.T, bkt objstore.Bucket)) 
 			t.Parallel()
 			defer closeFn()
 
-			// TODO(bwplotka): Add leaktest when https://github.com/GoogleCloudPlatform/google-cloud-go/issues/1025 is resolved.
+			// TODO(bwplotka): Add goleak when https://github.com/GoogleCloudPlatform/google-cloud-go/issues/1025 is resolved.
 			testFn(t, bkt)
 		})
 	}
@@ -89,8 +89,8 @@ func ForeachStore(t *testing.T, testFn func(t *testing.T, bkt objstore.Bucket)) 
 			t.Parallel()
 			defer closeFn()
 
-			// TODO(bwplotka): Add leaktest when we fix potential leak in minio library.
-			// We cannot use leaktest for detecting our own potential leaks, when leaktest detects leaks in minio itself.
+			// TODO(bwplotka): Add goleak when we fix potential leak in minio library.
+			// We cannot use goleak for detecting our own potential leaks, when goleak detects leaks in minio itself.
 			// This needs to be investigated more.
 
 			testFn(t, bkt)
@@ -138,16 +138,14 @@ func ForeachStore(t *testing.T, testFn func(t *testing.T, bkt objstore.Bucket)) 
 
 	// Optional OSS.
 	if !IsObjStoreSkipped(t, client.ALIYUNOSS) {
-		bkt, closeFn, err := oss.NewTestBucket(t)
-		testutil.Ok(t, err)
+		t.Run("AliYun oss", func(t *testing.T) {
+			bkt, closeFn, err := oss.NewTestBucket(t)
+			testutil.Ok(t, err)
 
-		ok := t.Run("AliYun oss", func(t *testing.T) {
+			t.Parallel()
+			defer closeFn()
+
 			testFn(t, bkt)
 		})
-
-		closeFn()
-		if !ok {
-			return
-		}
 	}
 }

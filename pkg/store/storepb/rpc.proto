@@ -4,9 +4,9 @@
 syntax = "proto3";
 package thanos;
 
-import "types.proto";
+import "store/storepb/types.proto";
 import "gogoproto/gogo.proto";
-import "prompb/types.proto";
+import "store/storepb/prompb/types.proto";
 import "google/protobuf/any.proto";
 
 option go_package = "storepb";
@@ -34,6 +34,9 @@ service Store {
   /// partition of the single series, but once a new series is started to be streamed it means that no more data will
   /// be sent for previous one.
   /// Series has to be sorted.
+  ///
+  /// There is no requirements on chunk sorting, however it is recommended to have chunk sorted by chunk min time.
+  /// This heavily optimizes the resource usage on Querier / Federated Queries.
   rpc Series(SeriesRequest) returns (stream SeriesResponse);
 
   /// LabelNames returns all label names that is available.
@@ -59,8 +62,7 @@ message WriteRequest {
   int64 replica = 3;
 }
 
-message InfoRequest {
-}
+message InfoRequest {}
 
 enum StoreType {
   UNKNOWN = 0;
@@ -87,20 +89,6 @@ message LabelSet {
   repeated Label labels = 1 [(gogoproto.nullable) = false];
 }
 
-/// PartialResponseStrategy controls partial response handling.
-enum PartialResponseStrategy {
-  /// WARN strategy tells server to treat any error that will related to single StoreAPI (e.g missing chunk series because of underlying
-  /// storeAPI is temporarily not available) as warning which will not fail the whole query (still OK response).
-  /// Server should produce those as a warnings field in response.
-  WARN = 0;
-  /// ABORT strategy tells server to treat any error that will related to single StoreAPI (e.g missing chunk series because of underlying
-  /// storeAPI is temporarily not available) as the gRPC error that aborts the query.
-  ///
-  /// This is especially useful for any rule/alert evaluations on top of StoreAPI which usually does not tolerate partial
-  /// errors.
-  ABORT = 1;
-}
-
 message SeriesRequest {
   int64 min_time                 = 1;
   int64 max_time                 = 2;
@@ -117,6 +105,11 @@ message SeriesRequest {
 
   // skip_chunks controls whether sending chunks or not in series responses.
   bool skip_chunks = 8;
+
+  // hints is an opaque data structure that can be used to carry additional information.
+  // The content of this field and whether it's supported depends on the
+  // implementation of a specific store.
+  google.protobuf.Any hints = 9;
 }
 
 enum Aggr {
@@ -130,10 +123,11 @@ enum Aggr {
 
 message SeriesResponse {
   oneof result {
+    /// series contains 1 response series. The series labels are sorted by name.
     Series series = 1;
 
     /// warning is considered an information piece in place of series for warning purposes.
-    /// It is used to warn query customer about suspicious cases or partial response (if enabled).
+    /// It is used to warn store API user about suspicious cases or partial response (if enabled).
     string warning = 2;
 
     /// hints is an opaque data structure that can be used to carry additional information from
@@ -150,10 +144,14 @@ message LabelNamesRequest {
 
   // TODO(bwplotka): Move Thanos components to use strategy instead. Including QueryAPI.
   PartialResponseStrategy partial_response_strategy = 2;
+
+  int64 start = 3;
+
+  int64 end = 4;
 }
 
 message LabelNamesResponse {
-  repeated string names = 1;
+  repeated string names    = 1;
   repeated string warnings = 2;
 }
 
@@ -164,9 +162,13 @@ message LabelValuesRequest {
 
   // TODO(bwplotka): Move Thanos components to use strategy instead. Including QueryAPI.
   PartialResponseStrategy partial_response_strategy = 3;
+
+  int64 start = 4;
+
+  int64 end = 5;
 }
 
 message LabelValuesResponse {
-  repeated string values = 1;
+  repeated string values   = 1;
   repeated string warnings = 2;
 }

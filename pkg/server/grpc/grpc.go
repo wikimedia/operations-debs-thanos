@@ -18,15 +18,17 @@ import (
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
-	"github.com/thanos-io/thanos/pkg/component"
-	"github.com/thanos-io/thanos/pkg/prober"
-	"github.com/thanos-io/thanos/pkg/store/storepb"
-	"github.com/thanos-io/thanos/pkg/tracing"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	grpc_health "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/status"
+
+	"github.com/thanos-io/thanos/pkg/component"
+	"github.com/thanos-io/thanos/pkg/prober"
+	"github.com/thanos-io/thanos/pkg/rules/rulespb"
+	"github.com/thanos-io/thanos/pkg/store/storepb"
+	"github.com/thanos-io/thanos/pkg/tracing"
 )
 
 // A Server defines parameters to serve RPC requests, a wrapper around grpc.Server.
@@ -40,8 +42,10 @@ type Server struct {
 	opts options
 }
 
-// New creates a new Server.
-func New(logger log.Logger, reg prometheus.Registerer, tracer opentracing.Tracer, comp component.Component, probe *prober.GRPCProbe, storeSrv storepb.StoreServer, opts ...Option) *Server {
+// New creates a new gRPC Store API.
+// If rulesSrv is not nil, it also registers Rules API to the returned server.
+func New(logger log.Logger, reg prometheus.Registerer, tracer opentracing.Tracer, comp component.Component, probe *prober.GRPCProbe, storeSrv storepb.StoreServer, rulesSrv rulespb.RulesServer, opts ...Option) *Server {
+	logger = log.With(logger, "service", "gRPC/server", "component", comp.String())
 	options := options{
 		network: "tcp",
 	}
@@ -83,14 +87,22 @@ func New(logger log.Logger, reg prometheus.Registerer, tracer opentracing.Tracer
 	}
 	s := grpc.NewServer(grpcOpts...)
 
-	storepb.RegisterStoreServer(s, storeSrv)
+	if rulesSrv != nil {
+		rulespb.RegisterRulesServer(s, rulesSrv)
+		storepb.RegisterStoreServer(s, storeSrv)
+		level.Info(logger).Log("msg", "registering as gRPC StoreAPI and RulesAPI")
+	} else {
+		storepb.RegisterStoreServer(s, storeSrv)
+		level.Info(logger).Log("msg", "registering as gRPC StoreAPI")
+	}
+
 	met.InitializeMetrics(s)
 	reg.MustRegister(met)
 
 	grpc_health.RegisterHealthServer(s, probe.HealthServer())
 
 	return &Server{
-		logger: log.With(logger, "service", "gRPC/server", "component", comp.String()),
+		logger: logger,
 		comp:   comp,
 		srv:    s,
 		opts:   options,
@@ -112,10 +124,11 @@ func (s *Server) ListenAndServe() error {
 // Shutdown gracefully shuts down the server by waiting,
 // for specified amount of time (by gracePeriod) for connections to return to idle and then shut down.
 func (s *Server) Shutdown(err error) {
-	defer level.Info(s.logger).Log("msg", "internal server shutdown", "err", err)
+	level.Info(s.logger).Log("msg", "internal server is shutting down", "err", err)
 
 	if s.opts.gracePeriod == 0 {
 		s.srv.Stop()
+		level.Info(s.logger).Log("msg", "internal server is shutdown", "err", err)
 		return
 	}
 
@@ -133,9 +146,11 @@ func (s *Server) Shutdown(err error) {
 	case <-ctx.Done():
 		level.Info(s.logger).Log("msg", "grace period exceeded enforcing shutdown")
 		s.srv.Stop()
+		return
 	case <-stopped:
 		cancel()
 	}
+	level.Info(s.logger).Log("msg", "internal server is shutdown gracefully", "err", err)
 }
 
 // ReadWriteStoreServer is a StoreServer and a WriteableStoreServer.
@@ -146,7 +161,7 @@ type ReadWriteStoreServer interface {
 
 // NewReadWrite creates a new server that can be written to.
 func NewReadWrite(logger log.Logger, reg prometheus.Registerer, tracer opentracing.Tracer, comp component.Component, probe *prober.GRPCProbe, storeSrv ReadWriteStoreServer, opts ...Option) *Server {
-	s := New(logger, reg, tracer, comp, probe, storeSrv, opts...)
+	s := New(logger, reg, tracer, comp, probe, storeSrv, nil, opts...)
 	storepb.RegisterWriteableStoreServer(s.srv, storeSrv)
 	return s
 }

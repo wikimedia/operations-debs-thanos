@@ -1,6 +1,8 @@
 // Copyright (c) The Thanos Authors.
 // Licensed under the Apache License 2.0.
 
+//nolint:unparam
+// TODO(kakkoyun): Fix linter issues - The pattern we use makes linter unhappy (returning unused config pointers).
 package main
 
 import (
@@ -96,6 +98,8 @@ type reloaderConfig struct {
 	confFile        string
 	envVarConfFile  string
 	ruleDirectories []string
+	watchInterval   time.Duration
+	retryInterval   time.Duration
 }
 
 func (rc *reloaderConfig) registerFlag(cmd *kingpin.CmdClause) *reloaderConfig {
@@ -108,21 +112,34 @@ func (rc *reloaderConfig) registerFlag(cmd *kingpin.CmdClause) *reloaderConfig {
 	cmd.Flag("reloader.rule-dir",
 		"Rule directories for the reloader to refresh (repeated field).").
 		StringsVar(&rc.ruleDirectories)
+	cmd.Flag("reloader.watch-interval",
+		"Controls how often reloader re-reads config and rules.").
+		Default("3m").DurationVar(&rc.watchInterval)
+	cmd.Flag("reloader.retry-interval",
+		"Controls how often reloader retries config reload in case of error.").
+		Default("5s").DurationVar(&rc.retryInterval)
+
 	return rc
 }
 
 type shipperConfig struct {
-	uploadCompacted bool
-	ignoreBlockSize bool
+	uploadCompacted       bool
+	ignoreBlockSize       bool
+	allowOutOfOrderUpload bool
 }
 
 func (sc *shipperConfig) registerFlag(cmd *kingpin.CmdClause) *shipperConfig {
 	cmd.Flag("shipper.upload-compacted",
-		"If true sidecar will try to upload compacted blocks as well. Useful for migration purposes. Works only if compaction is disabled on Prometheus. Do it once and then disable the flag when done.").
+		"If true shipper will try to upload compacted blocks as well. Useful for migration purposes. Works only if compaction is disabled on Prometheus. Do it once and then disable the flag when done.").
 		Default("false").BoolVar(&sc.uploadCompacted)
 	cmd.Flag("shipper.ignore-unequal-block-size",
-		"If true sidecar will not require prometheus min and max block size flags to be set to the same value. Only use this if you want to keep long retention and compaction enabled on your Prometheus instance, as in the worst case it can result in ~2h data loss for your Thanos bucket storage.").
+		"If true shipper will not require prometheus min and max block size flags to be set to the same value. Only use this if you want to keep long retention and compaction enabled on your Prometheus instance, as in the worst case it can result in ~2h data loss for your Thanos bucket storage.").
 		Default("false").Hidden().BoolVar(&sc.ignoreBlockSize)
+	cmd.Flag("shipper.allow-out-of-order-uploads",
+		"If true, shipper will skip failed block uploads in the given iteration and retry later. This means that some newer blocks might be uploaded sooner than older blocks."+
+			"This can trigger compaction without those blocks and as a result will create an overlap situation. Set it to true if you have vertical compaction enabled and wish to upload blocks as soon as possible without caring"+
+			"about order.").
+		Default("false").Hidden().BoolVar(&sc.allowOutOfOrderUpload)
 	return sc
 }
 

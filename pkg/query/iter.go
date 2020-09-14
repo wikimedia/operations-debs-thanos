@@ -11,6 +11,7 @@ import (
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
+
 	"github.com/thanos-io/thanos/pkg/compact/downsample"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
 )
@@ -27,6 +28,8 @@ type promSeriesSet struct {
 
 	currLset   []storepb.Label
 	currChunks []storepb.AggrChunk
+
+	warns storage.Warnings
 }
 
 func (s *promSeriesSet) Next() bool {
@@ -62,10 +65,8 @@ func (s *promSeriesSet) Next() bool {
 		return s.currChunks[i].MinTime < s.currChunks[j].MinTime
 	})
 
-	// newChunkSeriesIterator will handle overlaps well, however we don't need to iterate over those samples,
-	// removed early duplicates here.
-	// TODO(bwplotka): Remove chunk duplicates on proxy level as well to avoid decoding those.
-	// https://github.com/thanos-io/thanos/issues/2546, consider skipping removal here then.
+	// Proxy handles duplicates between different series, let's handle duplicates within single series now as well.
+	// We don't need to decode those.
 	s.currChunks = removeExactDuplicates(s.currChunks)
 	return true
 }
@@ -81,7 +82,7 @@ func removeExactDuplicates(chks []storepb.AggrChunk) []storepb.AggrChunk {
 	ret = append(ret, chks[0])
 
 	for _, c := range chks[1:] {
-		if ret[len(ret)-1].String() == c.String() {
+		if ret[len(ret)-1].Compare(c) == 0 {
 			continue
 		}
 		ret = append(ret, c)
@@ -100,34 +101,8 @@ func (s *promSeriesSet) Err() error {
 	return s.set.Err()
 }
 
-func translateMatcher(m *labels.Matcher) (storepb.LabelMatcher, error) {
-	var t storepb.LabelMatcher_Type
-
-	switch m.Type {
-	case labels.MatchEqual:
-		t = storepb.LabelMatcher_EQ
-	case labels.MatchNotEqual:
-		t = storepb.LabelMatcher_NEQ
-	case labels.MatchRegexp:
-		t = storepb.LabelMatcher_RE
-	case labels.MatchNotRegexp:
-		t = storepb.LabelMatcher_NRE
-	default:
-		return storepb.LabelMatcher{}, errors.Errorf("unrecognized matcher type %d", m.Type)
-	}
-	return storepb.LabelMatcher{Type: t, Name: m.Name, Value: m.Value}, nil
-}
-
-func translateMatchers(ms ...*labels.Matcher) ([]storepb.LabelMatcher, error) {
-	res := make([]storepb.LabelMatcher, 0, len(ms))
-	for _, m := range ms {
-		r, err := translateMatcher(m)
-		if err != nil {
-			return nil, err
-		}
-		res = append(res, r)
-	}
-	return res, nil
+func (s *promSeriesSet) Warnings() storage.Warnings {
+	return s.warns
 }
 
 // storeSeriesSet implements a storepb SeriesSet against a list of storepb.Series.
@@ -327,7 +302,7 @@ type chunkSeriesIterator struct {
 func newChunkSeriesIterator(cs []chunkenc.Iterator) chunkenc.Iterator {
 	if len(cs) == 0 {
 		// This should not happen. StoreAPI implementations should not send empty results.
-		return errSeriesIterator{}
+		return errSeriesIterator{err: errors.Errorf("store returned an empty result")}
 	}
 	return &chunkSeriesIterator{chunks: cs}
 }
@@ -413,8 +388,12 @@ func (s *dedupSeriesSet) peekLset() labels.Labels {
 	}
 	// Check how many replica labels are present so that these are removed.
 	var totalToRemove int
-	for index := 0; index < len(s.replicaLabels); index++ {
-		if _, ok := s.replicaLabels[lset[len(lset)-index-1].Name]; ok {
+	for i := 0; i < len(s.replicaLabels); i++ {
+		if len(lset)-i == 0 {
+			break
+		}
+
+		if _, ok := s.replicaLabels[lset[len(lset)-i-1].Name]; ok {
 			totalToRemove++
 		}
 	}
@@ -453,6 +432,10 @@ func (s *dedupSeriesSet) At() storage.Series {
 
 func (s *dedupSeriesSet) Err() error {
 	return s.set.Err()
+}
+
+func (s *dedupSeriesSet) Warnings() storage.Warnings {
+	return s.set.Warnings()
 }
 
 type seriesWithLabels struct {
@@ -520,7 +503,8 @@ func (it noopAdjustableSeriesIterator) adjustAtValue(float64) {}
 // Replica 1 counter scrapes: 20    30    40    Nan      -     0     5
 // Replica 2 counter scrapes:    25    35    45     Nan     -     2
 //
-// Now for downsampling purposes we are accounting the resets so our replicas before going to dedup iterator looks like this:
+// Now for downsampling purposes we are accounting the resets(rewriting the samples value)
+// so our replicas before going to dedup iterator looks like this:
 //
 // Replica 1 counter total: 20    30    40   -      -     40     45
 // Replica 2 counter total:    25    35    45    -     -     47
@@ -665,7 +649,7 @@ func (it *dedupSeriesIterator) Seek(t int64) bool {
 	// Don't use underlying Seek, but iterate over next to not miss gaps.
 	for {
 		ts, _ := it.At()
-		if ts > 0 && ts >= t {
+		if ts >= t {
 			return true
 		}
 		if !it.Next() {
@@ -686,4 +670,41 @@ func (it *dedupSeriesIterator) Err() error {
 		return it.a.Err()
 	}
 	return it.b.Err()
+}
+
+type lazySeriesSet struct {
+	create func() (s storage.SeriesSet, ok bool)
+
+	set storage.SeriesSet
+}
+
+func (c *lazySeriesSet) Next() bool {
+	if c.set != nil {
+		return c.set.Next()
+	}
+
+	var ok bool
+	c.set, ok = c.create()
+	return ok
+}
+
+func (c *lazySeriesSet) Err() error {
+	if c.set != nil {
+		return c.set.Err()
+	}
+	return nil
+}
+
+func (c *lazySeriesSet) At() storage.Series {
+	if c.set != nil {
+		return c.set.At()
+	}
+	return nil
+}
+
+func (c *lazySeriesSet) Warnings() storage.Warnings {
+	if c.set != nil {
+		return c.set.Warnings()
+	}
+	return nil
 }

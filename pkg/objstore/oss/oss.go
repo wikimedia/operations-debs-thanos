@@ -20,8 +20,10 @@ import (
 	alioss "github.com/aliyun/aliyun-oss-go-sdk/oss"
 	"github.com/go-kit/kit/log"
 	"github.com/pkg/errors"
-	"github.com/thanos-io/thanos/pkg/objstore"
 	"gopkg.in/yaml.v2"
+
+	"github.com/thanos-io/thanos/pkg/objstore"
+	"github.com/thanos-io/thanos/pkg/objstore/clientutil"
 )
 
 // Part size for multi part upload.
@@ -130,24 +132,29 @@ func (b *Bucket) Delete(ctx context.Context, name string) error {
 	return nil
 }
 
-// ObjectSize returns the size of the specified object.
-func (b *Bucket) ObjectSize(ctx context.Context, name string) (uint64, error) {
-	// refer to https://github.com/aliyun/aliyun-oss-go-sdk/blob/cee409f5b4d75d7ad077cacb7e6f4590a7f2e172/oss/bucket.go#L668.
+// Attributes returns information about the specified object.
+func (b *Bucket) Attributes(ctx context.Context, name string) (objstore.ObjectAttributes, error) {
 	m, err := b.bucket.GetObjectMeta(name)
 	if err != nil {
-		return 0, err
+		return objstore.ObjectAttributes{}, err
 	}
-	if v, ok := m["Content-Length"]; ok {
-		if len(v) == 0 {
-			return 0, errors.New("content-length header has no values")
-		}
-		ret, err := strconv.ParseUint(v[0], 10, 64)
-		if err != nil {
-			return 0, errors.Wrap(err, "convert content-length")
-		}
-		return ret, nil
+
+	size, err := clientutil.ParseContentLength(m)
+	if err != nil {
+		return objstore.ObjectAttributes{}, err
 	}
-	return 0, errors.New("content-length header not found")
+
+	// aliyun oss return Last-Modified header in RFC1123 format.
+	// see api doc for details: https://www.alibabacloud.com/help/doc-detail/31985.htm
+	mod, err := clientutil.ParseLastModified(m, time.RFC1123)
+	if err != nil {
+		return objstore.ObjectAttributes{}, err
+	}
+
+	return objstore.ObjectAttributes{
+		Size:         size,
+		LastModified: mod,
+	}, nil
 }
 
 // NewBucket returns a new Bucket using the provided oss config values.
@@ -296,7 +303,7 @@ func (b *Bucket) setRange(start, end int64, name string) (alioss.Option, error) 
 	return opt, nil
 }
 
-func (b *Bucket) getRange(ctx context.Context, name string, off, length int64) (io.ReadCloser, error) {
+func (b *Bucket) getRange(_ context.Context, name string, off, length int64) (io.ReadCloser, error) {
 	if len(name) == 0 {
 		return nil, errors.New("given object name should not empty")
 	}
