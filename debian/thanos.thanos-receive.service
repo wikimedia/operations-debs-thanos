@@ -1,0 +1,15 @@
+[Unit]
+Description=Thanos receive
+Documentation=https://github.com/thanos-io/thanos/
+
+[Service]
+Restart=always
+User=thanos
+EnvironmentFile=/etc/default/thanos-receive
+ExecStart=/usr/bin/thanos receive $ARGS
+ExecReload=/bin/kill -HUP $MAINPID
+TimeoutStopSec=20s
+SendSIGKILL=no
+
+[Install]
+WantedBy=multi-user.target

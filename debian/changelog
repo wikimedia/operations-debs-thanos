@@ -1,6 +1,7 @@
 thanos (0.16.0~rc0-1) buster-wikimedia; urgency=medium
 
   * New upstream release
+  * Ship thanos-receive
 
  -- Filippo Giunchedi <filippo@debian.org>  Mon, 12 Oct 2020 10:53:22 +0200
 
