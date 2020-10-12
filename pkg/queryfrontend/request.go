@@ -9,8 +9,8 @@ import (
 	"github.com/cortexproject/cortex/pkg/querier/queryrange"
 	"github.com/opentracing/opentracing-go"
 	otlog "github.com/opentracing/opentracing-go/log"
+	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/pkg/timestamp"
-	"github.com/thanos-io/thanos/pkg/store/storepb"
 )
 
 type ThanosRequest struct {
@@ -25,7 +25,8 @@ type ThanosRequest struct {
 	AutoDownsampling    bool
 	MaxSourceResolution int64
 	ReplicaLabels       []string
-	StoreMatchers       [][]storepb.LabelMatcher
+	StoreMatchers       [][]*labels.Matcher
+	CachingOptions      queryrange.CachingOptions
 }
 
 // GetStart returns the start timestamp of the request in milliseconds.
@@ -46,6 +47,10 @@ func (r *ThanosRequest) GetStep() int64 {
 // GetQuery returns the query of the request.
 func (r *ThanosRequest) GetQuery() string {
 	return r.Query
+}
+
+func (r *ThanosRequest) GetCachingOptions() queryrange.CachingOptions {
+	return r.CachingOptions
 }
 
 // WithStartEnd clone the current request with different start and end timestamp.

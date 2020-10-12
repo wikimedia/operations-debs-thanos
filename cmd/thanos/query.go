@@ -23,7 +23,8 @@ import (
 	"github.com/prometheus/prometheus/discovery/targetgroup"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/promql"
-	"gopkg.in/alecthomas/kingpin.v2"
+
+	"github.com/thanos-io/thanos/pkg/extkingpin"
 
 	v1 "github.com/thanos-io/thanos/pkg/api/query"
 	"github.com/thanos-io/thanos/pkg/component"
@@ -32,6 +33,7 @@ import (
 	"github.com/thanos-io/thanos/pkg/extgrpc"
 	"github.com/thanos-io/thanos/pkg/extprom"
 	extpromhttp "github.com/thanos-io/thanos/pkg/extprom/http"
+	"github.com/thanos-io/thanos/pkg/gate"
 	"github.com/thanos-io/thanos/pkg/logging"
 	"github.com/thanos-io/thanos/pkg/prober"
 	"github.com/thanos-io/thanos/pkg/query"
@@ -45,7 +47,7 @@ import (
 )
 
 // registerQuery registers a query command.
-func registerQuery(m map[string]setupFunc, app *kingpin.Application) {
+func registerQuery(app *extkingpin.App) {
 	comp := component.Query
 	cmd := app.Command(comp.String(), "query node exposing PromQL enabled Query API with data retrieved from multiple store nodes")
 
@@ -79,6 +81,8 @@ func registerQuery(m map[string]setupFunc, app *kingpin.Application) {
 		Strings()
 
 	instantDefaultMaxSourceResolution := modelDuration(cmd.Flag("query.instant.default.max_source_resolution", "default value for max_source_resolution for instant queries. If not set, defaults to 0s only taking raw resolution into account. 1h can be a good value if you use instant queries over time ranges that incorporate times outside of your raw-retention.").Default("0s").Hidden())
+
+	defaultMetadataTimeRange := cmd.Flag("query.metadata.default-time-range", "The default metadata time range duration for retrieving labels through Labels and Series API when the range parameters are not specified. The zero value means range covers the time since the beginning.").Default("0s").Duration()
 
 	selectorLabels := cmd.Flag("selector-label", "Query selector labels that will be exposed in info endpoint (repeated).").
 		PlaceHolder("<name>=\"<value>\"").Strings()
@@ -121,7 +125,7 @@ func registerQuery(m map[string]setupFunc, app *kingpin.Application) {
 
 	storeResponseTimeout := modelDuration(cmd.Flag("store.response-timeout", "If a Store doesn't send any data in this specified duration then a Store will be ignored and partial data will be returned if it's enabled. 0 disables timeout.").Default("0ms"))
 
-	m[comp.String()] = func(g *run.Group, logger log.Logger, reg *prometheus.Registry, tracer opentracing.Tracer, _ <-chan struct{}, _ bool) error {
+	cmd.Setup(func(g *run.Group, logger log.Logger, reg *prometheus.Registry, tracer opentracing.Tracer, _ <-chan struct{}, _ bool) error {
 		selectorLset, err := parseFlagLabels(*selectorLabels)
 		if err != nil {
 			return errors.Wrap(err, "parse federation labels")
@@ -152,7 +156,6 @@ func registerQuery(m map[string]setupFunc, app *kingpin.Application) {
 			level.Warn(logger).Log("msg", "different values for --web.route-prefix and --web.external-prefix detected, web UI may not work without a reverse-proxy.")
 		}
 
-		flagsMap := getFlagsMap(cmd.Model().Flags)
 		return runQuery(
 			g,
 			logger,
@@ -182,7 +185,7 @@ func registerQuery(m map[string]setupFunc, app *kingpin.Application) {
 			time.Duration(*storeResponseTimeout),
 			*queryReplicaLabels,
 			selectorLset,
-			flagsMap,
+			getFlagsMap(cmd.Flags()),
 			*stores,
 			*ruleEndpoints,
 			*enableAutodownsampling,
@@ -193,10 +196,11 @@ func registerQuery(m map[string]setupFunc, app *kingpin.Application) {
 			*dnsSDResolver,
 			time.Duration(*unhealthyStoreTimeout),
 			time.Duration(*instantDefaultMaxSourceResolution),
+			*defaultMetadataTimeRange,
 			*strictStores,
 			component.Query,
 		)
-	}
+	})
 }
 
 // runQuery starts a server that exposes PromQL Query API. It is responsible for querying configured
@@ -241,6 +245,7 @@ func runQuery(
 	dnsSDResolver string,
 	unhealthyStoreTimeout time.Duration,
 	instantDefaultMaxSourceResolution time.Duration,
+	defaultMetadataTimeRange time.Duration,
 	strictStores []string,
 	comp component.Component,
 ) error {
@@ -305,8 +310,14 @@ func runQuery(
 		)
 		proxy            = store.NewProxyStore(logger, reg, stores.Get, component.Query, selectorLset, storeResponseTimeout)
 		rulesProxy       = rules.NewProxy(logger, stores.GetRulesClients)
-		queryableCreator = query.NewQueryableCreator(logger, reg, proxy, maxConcurrentSelects, queryTimeout)
-		engine           = promql.NewEngine(
+		queryableCreator = query.NewQueryableCreator(
+			logger,
+			extprom.WrapRegistererWithPrefix("thanos_query_", reg),
+			proxy,
+			maxConcurrentSelects,
+			queryTimeout,
+		)
+		engine = promql.NewEngine(
 			promql.EngineOpts{
 				Logger: logger,
 				Reg:    reg,
@@ -408,7 +419,10 @@ func runQuery(
 		// Redirect from / to /webRoutePrefix.
 		if webRoutePrefix != "/" {
 			router.Get("/", func(w http.ResponseWriter, r *http.Request) {
-				http.Redirect(w, r, webRoutePrefix, http.StatusFound)
+				http.Redirect(w, r, webRoutePrefix+"/graph", http.StatusFound)
+			})
+			router.Get(webRoutePrefix, func(w http.ResponseWriter, r *http.Request) {
+				http.Redirect(w, r, webRoutePrefix+"/graph", http.StatusFound)
 			})
 			router = router.WithPrefix(webRoutePrefix)
 		}
@@ -421,11 +435,10 @@ func runQuery(
 
 		ins := extpromhttp.NewInstrumentationMiddleware(reg)
 		// TODO(bplotka in PR #513 review): pass all flags, not only the flags needed by prefix rewriting.
-		ui.NewQueryUI(logger, reg, stores, webExternalPrefix, webPrefixHeaderName).Register(router, ins)
+		ui.NewQueryUI(logger, stores, webExternalPrefix, webPrefixHeaderName).Register(router, ins)
 
 		api := v1.NewQueryAPI(
 			logger,
-			reg,
 			stores,
 			engine,
 			queryableCreator,
@@ -437,7 +450,11 @@ func runQuery(
 			queryReplicaLabels,
 			flagsMap,
 			instantDefaultMaxSourceResolution,
-			maxConcurrentQueries,
+			defaultMetadataTimeRange,
+			gate.New(
+				extprom.WrapRegistererWithPrefix("thanos_query_concurrent_", reg),
+				maxConcurrentQueries,
+			),
 		)
 
 		api.Register(router.WithPrefix("/api/v1"), tracer, logger, ins, logMiddleware)
@@ -466,7 +483,9 @@ func runQuery(
 			return errors.Wrap(err, "setup gRPC server")
 		}
 
-		s := grpcserver.New(logger, reg, tracer, comp, grpcProbe, proxy, rulesProxy,
+		s := grpcserver.New(logger, reg, tracer, comp, grpcProbe,
+			grpcserver.WithServer(store.RegisterStoreServer(proxy)),
+			grpcserver.WithServer(rules.RegisterRulesServer(rulesProxy)),
 			grpcserver.WithListen(grpcBindAddr),
 			grpcserver.WithGracePeriod(grpcGracePeriod),
 			grpcserver.WithTLSConfig(tlsCfg),

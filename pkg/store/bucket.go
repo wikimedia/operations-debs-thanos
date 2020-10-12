@@ -44,10 +44,10 @@ import (
 	"github.com/thanos-io/thanos/pkg/model"
 	"github.com/thanos-io/thanos/pkg/objstore"
 	"github.com/thanos-io/thanos/pkg/pool"
-	"github.com/thanos-io/thanos/pkg/promclient"
 	"github.com/thanos-io/thanos/pkg/runutil"
 	storecache "github.com/thanos-io/thanos/pkg/store/cache"
 	"github.com/thanos-io/thanos/pkg/store/hintspb"
+	"github.com/thanos-io/thanos/pkg/store/labelpb"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
 	"github.com/thanos-io/thanos/pkg/strutil"
 	"github.com/thanos-io/thanos/pkg/tracing"
@@ -410,21 +410,17 @@ func (s *BucketStore) SyncBlocks(ctx context.Context) error {
 	}
 
 	// Sync advertise labels.
-	var storeLabels []storepb.Label
+	var storeLabels labels.Labels
 	s.mtx.Lock()
-	s.advLabelSets = s.advLabelSets[:0]
+	s.advLabelSets = make([]storepb.LabelSet, 0, len(s.advLabelSets))
 	for _, bs := range s.blockSets {
-		storeLabels := storeLabels[:0]
-		for _, l := range bs.labels {
-			storeLabels = append(storeLabels, storepb.Label{Name: l.Name, Value: l.Value})
-		}
-		s.advLabelSets = append(s.advLabelSets, storepb.LabelSet{Labels: storeLabels})
+		storeLabels = storeLabels[:0]
+		s.advLabelSets = append(s.advLabelSets, storepb.LabelSet{Labels: labelpb.LabelsFromPromLabels(append(storeLabels, bs.labels...))})
 	}
 	sort.Slice(s.advLabelSets, func(i, j int) bool {
 		return strings.Compare(s.advLabelSets[i].String(), s.advLabelSets[j].String()) < 0
 	})
 	s.mtx.Unlock()
-
 	return nil
 }
 
@@ -602,7 +598,6 @@ func (s *BucketStore) Info(context.Context, *storepb.InfoRequest) (*storepb.Info
 	}
 
 	s.mtx.RLock()
-	// Should we clone?
 	res.LabelSets = s.advLabelSets
 	s.mtx.RUnlock()
 
@@ -643,7 +638,7 @@ func (s *BucketStore) limitMaxTime(maxt int64) int64 {
 }
 
 type seriesEntry struct {
-	lset []storepb.Label
+	lset labels.Labels
 	refs []uint64
 	chks []storepb.AggrChunk
 }
@@ -669,7 +664,7 @@ func (s *bucketSeriesSet) Next() bool {
 	return true
 }
 
-func (s *bucketSeriesSet) At() ([]storepb.Label, []storepb.AggrChunk) {
+func (s *bucketSeriesSet) At() (labels.Labels, []storepb.AggrChunk) {
 	return s.set[s.i].lset, s.set[s.i].chks
 }
 
@@ -713,7 +708,7 @@ func blockSeries(
 			return nil, nil, errors.Wrap(err, "read series")
 		}
 		s := seriesEntry{
-			lset: make([]storepb.Label, 0, len(lset)+len(extLset)),
+			lset: make(labels.Labels, 0, len(lset)+len(extLset)),
 			refs: make([]uint64, 0, len(chks)),
 			chks: make([]storepb.AggrChunk, 0, len(chks)),
 		}
@@ -723,20 +718,12 @@ func blockSeries(
 			if extLset[l.Name] != "" {
 				continue
 			}
-			s.lset = append(s.lset, storepb.Label{
-				Name:  l.Name,
-				Value: l.Value,
-			})
+			s.lset = append(s.lset, l)
 		}
 		for ln, lv := range extLset {
-			s.lset = append(s.lset, storepb.Label{
-				Name:  ln,
-				Value: lv,
-			})
+			s.lset = append(s.lset, labels.Label{Name: ln, Value: lv})
 		}
-		sort.Slice(s.lset, func(i, j int) bool {
-			return s.lset[i].Name < s.lset[j].Name
-		})
+		sort.Sort(s.lset)
 
 		for _, meta := range chks {
 			if meta.MaxTime < req.MinTime {
@@ -881,7 +868,7 @@ func (s *BucketStore) Series(req *storepb.SeriesRequest, srv storepb.Store_Serie
 		defer s.queryGate.Done()
 	}
 
-	matchers, err := promclient.TranslateMatchers(req.Matchers)
+	matchers, err := storepb.TranslateFromPromMatchers(req.Matchers...)
 	if err != nil {
 		return status.Error(codes.InvalidArgument, err.Error())
 	}
@@ -905,7 +892,7 @@ func (s *BucketStore) Series(req *storepb.SeriesRequest, srv storepb.Store_Serie
 			return status.Error(codes.InvalidArgument, errors.Wrap(err, "unmarshal series request hints").Error())
 		}
 
-		reqBlockMatchers, err = promclient.TranslateMatchers(reqHints.BlockMatchers)
+		reqBlockMatchers, err = storepb.TranslateFromPromMatchers(reqHints.BlockMatchers...)
 		if err != nil {
 			return status.Error(codes.InvalidArgument, errors.Wrap(err, "translate request hints labels matchers").Error())
 		}
@@ -1019,15 +1006,16 @@ func (s *BucketStore) Series(req *storepb.SeriesRequest, srv storepb.Store_Serie
 
 			stats.mergedSeriesCount++
 
+			var lset labels.Labels
 			if req.SkipChunks {
-				series.Labels, _ = set.At()
+				lset, _ = set.At()
 			} else {
-				series.Labels, series.Chunks = set.At()
+				lset, series.Chunks = set.At()
 
 				stats.mergedChunksCount += len(series.Chunks)
 				s.metrics.chunkSizeBytes.Observe(float64(chunksSize(series.Chunks)))
 			}
-
+			series.Labels = labelpb.LabelsFromPromLabels(lset)
 			if err = srv.Send(storepb.NewSeriesResponse(&series)); err != nil {
 				err = status.Error(codes.Unknown, errors.Wrap(err, "send series response").Error())
 				return
@@ -1068,7 +1056,7 @@ func chunksSize(chks []storepb.AggrChunk) (size int) {
 }
 
 // LabelNames implements the storepb.StoreServer interface.
-func (s *BucketStore) LabelNames(ctx context.Context, r *storepb.LabelNamesRequest) (*storepb.LabelNamesResponse, error) {
+func (s *BucketStore) LabelNames(ctx context.Context, req *storepb.LabelNamesRequest) (*storepb.LabelNamesResponse, error) {
 	g, gctx := errgroup.WithContext(ctx)
 
 	s.mtx.RLock()
@@ -1077,7 +1065,7 @@ func (s *BucketStore) LabelNames(ctx context.Context, r *storepb.LabelNamesReque
 	var sets [][]string
 
 	for _, b := range s.blocks {
-		if b.meta.MinTime > r.End || b.meta.MaxTime < r.Start {
+		if !b.overlapsClosedInterval(req.Start, req.End) {
 			continue
 		}
 		indexr := b.indexReader(gctx)
@@ -1116,7 +1104,7 @@ func (s *BucketStore) LabelValues(ctx context.Context, req *storepb.LabelValuesR
 	var sets [][]string
 
 	for _, b := range s.blocks {
-		if b.meta.MinTime > req.End || b.meta.MaxTime < req.Start {
+		if !b.overlapsClosedInterval(req.Start, req.End) {
 			continue
 		}
 		indexr := b.indexReader(gctx)
@@ -1414,6 +1402,13 @@ func (b *bucketBlock) matchRelabelLabels(matchers []*labels.Matcher) bool {
 		}
 	}
 	return true
+}
+
+// overlapsClosedInterval returns true if the block overlaps [mint, maxt).
+func (b *bucketBlock) overlapsClosedInterval(mint, maxt int64) bool {
+	// The block itself is a half-open interval
+	// [b.meta.MinTime, b.meta.MaxTime).
+	return b.meta.MinTime <= maxt && mint < b.meta.MaxTime
 }
 
 // Close waits for all pending readers to finish and then closes all underlying resources.

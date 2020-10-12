@@ -5,10 +5,12 @@ package queryfrontend
 
 import (
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/cortexproject/cortex/pkg/querier/frontend"
 	"github.com/cortexproject/cortex/pkg/querier/queryrange"
+	"github.com/cortexproject/cortex/pkg/util/validation"
 
 	"github.com/go-kit/kit/log"
 	"github.com/pkg/errors"
@@ -22,13 +24,12 @@ const (
 	labelQueryRange = "query_range"
 )
 
-func NewTripperWare(
-	limits queryrange.Limits,
-	cacheConfig *queryrange.ResultsCacheConfig,
-	codec queryrange.Codec,
-	cacheExtractor queryrange.Extractor,
-	splitQueryInterval time.Duration,
-	maxRetries int,
+// NewTripperware returns a Tripperware configured with middlewares to
+// limit, align, split,cache requests and retry.
+// Not using the cortex one as it uses  query parallelisations based on
+// storage sharding configuration and query ASTs.
+func NewTripperware(
+	config Config,
 	reg prometheus.Registerer,
 	logger log.Logger,
 ) (frontend.Tripperware, error) {
@@ -40,6 +41,11 @@ func NewTripperWare(
 	queriesCount.WithLabelValues(labelQuery)
 	queriesCount.WithLabelValues(labelQueryRange)
 
+	limits, err := validation.NewOverrides(*config.CortexLimits, nil)
+	if err != nil {
+		return nil, errors.Wrap(err, "initialize limits")
+	}
+
 	metrics := queryrange.NewInstrumentMiddlewareMetrics(reg)
 	queryRangeMiddleware := []queryrange.Middleware{queryrange.LimitsMiddleware(limits)}
 
@@ -50,28 +56,30 @@ func NewTripperWare(
 		queryrange.StepAlignMiddleware,
 	)
 
-	if splitQueryInterval != 0 {
+	codec := NewThanosCodec(config.PartialResponseStrategy)
+
+	if config.SplitQueriesByInterval != 0 {
+		// TODO(yeya24): make interval dynamic in next pr.
+		queryIntervalFn := func(_ queryrange.Request) time.Duration {
+			return config.SplitQueriesByInterval
+		}
 		queryRangeMiddleware = append(
 			queryRangeMiddleware,
 			queryrange.InstrumentMiddleware("split_by_interval", metrics),
-			queryrange.SplitByIntervalMiddleware(splitQueryInterval, limits, codec, reg),
+			queryrange.SplitByIntervalMiddleware(queryIntervalFn, limits, codec, reg),
 		)
 	}
 
-	if cacheConfig != nil {
-		// constSplitter will panic when splitQueryInterval is 0.
-		if splitQueryInterval == 0 {
-			return nil, errors.New("cannot create results cache middleware when split interval is 0")
-		}
-
+	if config.CortexResultsCacheConfig != nil {
 		queryCacheMiddleware, _, err := queryrange.NewResultsCacheMiddleware(
 			logger,
-			*cacheConfig,
-			newThanosCacheKeyGenerator(splitQueryInterval),
+			*config.CortexResultsCacheConfig,
+			newThanosCacheKeyGenerator(config.SplitQueriesByInterval),
 			limits,
 			codec,
-			cacheExtractor,
+			queryrange.PrometheusResponseExtractor{},
 			nil,
+			shouldCache,
 			reg,
 		)
 		if err != nil {
@@ -85,30 +93,39 @@ func NewTripperWare(
 		)
 	}
 
-	if maxRetries > 0 {
+	if config.MaxRetries > 0 {
 		queryRangeMiddleware = append(
 			queryRangeMiddleware,
 			queryrange.InstrumentMiddleware("retry", metrics),
-			queryrange.NewRetryMiddleware(logger, maxRetries, queryrange.NewRetryMiddlewareMetrics(reg)),
+			queryrange.NewRetryMiddleware(logger, config.MaxRetries, queryrange.NewRetryMiddlewareMetrics(reg)),
 		)
 	}
 
 	return func(next http.RoundTripper) http.RoundTripper {
 		queryRangeTripper := queryrange.NewRoundTripper(next, codec, queryRangeMiddleware...)
 		return frontend.RoundTripFunc(func(r *http.Request) (*http.Response, error) {
-			switch r.URL.Path {
-			case "/api/v1/query":
+			if strings.HasSuffix(r.URL.Path, "/api/v1/query") {
 				if r.Method == http.MethodGet || r.Method == http.MethodPost {
 					queriesCount.WithLabelValues(labelQuery).Inc()
 				}
-			case "/api/v1/query_range":
+			} else if strings.HasSuffix(r.URL.Path, "/api/v1/query_range") {
 				if r.Method == http.MethodGet || r.Method == http.MethodPost {
 					queriesCount.WithLabelValues(labelQueryRange).Inc()
 					return queryRangeTripper.RoundTrip(r)
 				}
-			default:
 			}
 			return next.RoundTrip(r)
 		})
 	}, nil
+}
+
+// Don't go to response cache if StoreMatchers are set.
+func shouldCache(r queryrange.Request) bool {
+	if thanosReq, ok := r.(*ThanosRequest); ok {
+		if len(thanosReq.StoreMatchers) > 0 {
+			return false
+		}
+	}
+
+	return !r.GetCachingOptions().Disabled
 }

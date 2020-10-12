@@ -24,6 +24,7 @@ import (
 	"github.com/thanos-io/thanos/pkg/component"
 	"github.com/thanos-io/thanos/pkg/extflag"
 	"github.com/thanos-io/thanos/pkg/exthttp"
+	"github.com/thanos-io/thanos/pkg/extkingpin"
 	"github.com/thanos-io/thanos/pkg/extprom"
 	thanoshttp "github.com/thanos-io/thanos/pkg/http"
 	thanosmodel "github.com/thanos-io/thanos/pkg/model"
@@ -37,39 +38,28 @@ import (
 	httpserver "github.com/thanos-io/thanos/pkg/server/http"
 	"github.com/thanos-io/thanos/pkg/shipper"
 	"github.com/thanos-io/thanos/pkg/store"
-	"github.com/thanos-io/thanos/pkg/store/storepb"
 	"github.com/thanos-io/thanos/pkg/tls"
 	"github.com/thanos-io/thanos/pkg/tracing"
-	"gopkg.in/alecthomas/kingpin.v2"
 )
 
-func registerSidecar(m map[string]setupFunc, app *kingpin.Application) {
-	cmd := app.Command(component.Sidecar.String(), "sidecar for Prometheus server")
+func registerSidecar(app *extkingpin.App) {
+	cmd := app.Command(component.Sidecar.String(), "Sidecar for Prometheus server")
 	conf := &sidecarConfig{}
 	conf.registerFlag(cmd)
-
-	m[component.Sidecar.String()] = func(g *run.Group, logger log.Logger, reg *prometheus.Registry, tracer opentracing.Tracer, _ <-chan struct{}, _ bool) error {
+	cmd.Setup(func(g *run.Group, logger log.Logger, reg *prometheus.Registry, tracer opentracing.Tracer, _ <-chan struct{}, _ bool) error {
 		rl := reloader.New(log.With(logger, "component", "reloader"),
 			extprom.WrapRegistererWithPrefix("thanos_sidecar_", reg),
 			&reloader.Options{
 				ReloadURL:     reloader.ReloadURLFromBase(conf.prometheus.url),
 				CfgFile:       conf.reloader.confFile,
 				CfgOutputFile: conf.reloader.envVarConfFile,
-				RuleDirs:      conf.reloader.ruleDirectories,
+				WatchedDirs:   conf.reloader.ruleDirectories,
 				WatchInterval: conf.reloader.watchInterval,
 				RetryInterval: conf.reloader.retryInterval,
 			})
 
-		return runSidecar(
-			g,
-			logger,
-			reg,
-			tracer,
-			rl,
-			component.Sidecar,
-			*conf,
-		)
-	}
+		return runSidecar(g, logger, reg, tracer, rl, component.Sidecar, *conf)
+	})
 }
 
 func runSidecar(
@@ -136,7 +126,7 @@ func runSidecar(
 		})
 		lastHeartbeat := promauto.With(reg).NewGauge(prometheus.GaugeOpts{
 			Name: "thanos_sidecar_last_heartbeat_success_time_seconds",
-			Help: "Second timestamp of the last successful heartbeat.",
+			Help: "Timestamp of the last successful heartbeat in seconds.",
 		})
 
 		ctx, cancel := context.WithCancel(context.Background())
@@ -214,7 +204,7 @@ func runSidecar(
 		t.MaxIdleConns = conf.connection.maxIdleConns
 		c := promclient.NewClient(&http.Client{Transport: tracing.HTTPTripperware(logger, t)}, logger, thanoshttp.ThanosUserAgent)
 
-		promStore, err := store.NewPrometheusStore(logger, c, conf.prometheus.url, component.Sidecar, m.Labels, m.Timestamps)
+		promStore, err := store.NewPrometheusStore(logger, reg, c, conf.prometheus.url, component.Sidecar, m.Labels, m.Timestamps)
 		if err != nil {
 			return errors.Wrap(err, "create Prometheus store")
 		}
@@ -225,7 +215,9 @@ func runSidecar(
 			return errors.Wrap(err, "setup gRPC server")
 		}
 
-		s := grpcserver.New(logger, reg, tracer, comp, grpcProbe, promStore, rules.NewPrometheus(conf.prometheus.url, c, m.Labels),
+		s := grpcserver.New(logger, reg, tracer, comp, grpcProbe,
+			grpcserver.WithServer(store.RegisterStoreServer(promStore)),
+			grpcserver.WithServer(rules.RegisterRulesServer(rules.NewPrometheus(conf.prometheus.url, c, m.Labels))),
 			grpcserver.WithListen(conf.grpc.bindAddress),
 			grpcserver.WithGracePeriod(time.Duration(conf.grpc.gracePeriod)),
 			grpcserver.WithTLSConfig(tlsCfg),
@@ -382,20 +374,6 @@ func (s *promMetadata) Labels() labels.Labels {
 	return s.labels
 }
 
-func (s *promMetadata) LabelsPB() []storepb.Label {
-	s.mtx.Lock()
-	defer s.mtx.Unlock()
-
-	lset := make([]storepb.Label, 0, len(s.labels))
-	for _, l := range s.labels {
-		lset = append(lset, storepb.Label{
-			Name:  l.Name,
-			Value: l.Value,
-		})
-	}
-	return lset
-}
-
 func (s *promMetadata) Timestamps() (mint int64, maxt int64) {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
@@ -415,7 +393,7 @@ type sidecarConfig struct {
 	limitMinTime thanosmodel.TimeOrDurationValue
 }
 
-func (sc *sidecarConfig) registerFlag(cmd *kingpin.CmdClause) {
+func (sc *sidecarConfig) registerFlag(cmd extkingpin.FlagClause) {
 	sc.http.registerFlag(cmd)
 	sc.grpc.registerFlag(cmd)
 	sc.prometheus.registerFlag(cmd)

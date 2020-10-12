@@ -14,13 +14,14 @@ import (
 	"github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/common/route"
+
 	blocksAPI "github.com/thanos-io/thanos/pkg/api/blocks"
 	"github.com/thanos-io/thanos/pkg/block"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 	"github.com/thanos-io/thanos/pkg/component"
 	"github.com/thanos-io/thanos/pkg/extflag"
+	"github.com/thanos-io/thanos/pkg/extkingpin"
 	"github.com/thanos-io/thanos/pkg/extprom"
 	extpromhttp "github.com/thanos-io/thanos/pkg/extprom/http"
 	"github.com/thanos-io/thanos/pkg/gate"
@@ -35,13 +36,12 @@ import (
 	storecache "github.com/thanos-io/thanos/pkg/store/cache"
 	"github.com/thanos-io/thanos/pkg/tls"
 	"github.com/thanos-io/thanos/pkg/ui"
-	"gopkg.in/alecthomas/kingpin.v2"
 )
 
 const fetcherConcurrency = 32
 
 // registerStore registers a store command.
-func registerStore(m map[string]setupFunc, app *kingpin.Application) {
+func registerStore(app *extkingpin.App) {
 	cmd := app.Command(component.Store.String(), "store node giving access to blocks in a bucket provider. Now supported GCS, S3, Azure, Swift and Tencent COS.")
 
 	httpBindAddr, httpGracePeriod := regHTTPFlags(cmd)
@@ -110,7 +110,7 @@ func registerStore(m map[string]setupFunc, app *kingpin.Application) {
 	webExternalPrefix := cmd.Flag("web.external-prefix", "Static prefix for all HTML links and redirect URLs in the bucket web UI interface. Actual endpoints are still served on / or the web.route-prefix. This allows thanos bucket web UI to be served behind a reverse proxy that strips a URL sub-path.").Default("").String()
 	webPrefixHeaderName := cmd.Flag("web.prefix-header", "Name of HTTP request header used for dynamic prefixing of UI links and redirects. This option is ignored if web.external-prefix argument is set. Security risk: enable this option only if a reverse proxy in front of thanos is resetting the header. The --web.prefix-header=X-Forwarded-Prefix option can be useful, for example, if Thanos UI is served via Traefik reverse proxy with PathPrefixStrip option enabled, which sends the stripped prefix value in X-Forwarded-Prefix header. This allows thanos UI to be served on a sub-path.").Default("").String()
 
-	m[component.Store.String()] = func(g *run.Group, logger log.Logger, reg *prometheus.Registry, tracer opentracing.Tracer, _ <-chan struct{}, debugLogging bool) error {
+	cmd.Setup(func(g *run.Group, logger log.Logger, reg *prometheus.Registry, tracer opentracing.Tracer, _ <-chan struct{}, debugLogging bool) error {
 		if minTime.PrometheusTimestamp() > maxTime.PrometheusTimestamp() {
 			return errors.Errorf("invalid argument: --min-time '%s' can't be greater than --max-time '%s'",
 				minTime, maxTime)
@@ -151,9 +151,9 @@ func registerStore(m map[string]setupFunc, app *kingpin.Application) {
 			*webPrefixHeaderName,
 			*postingOffsetsInMemSampling,
 			cachingBucketConfig,
-			getFlagsMap(cmd.Model().Flags),
+			getFlagsMap(cmd.Flags()),
 		)
-	}
+	})
 }
 
 // runStore starts a daemon that serves queries to cluster peers using data from an object store.
@@ -285,11 +285,7 @@ func runStore(
 		return errors.Errorf("max concurrency value cannot be lower than 0 (got %v)", maxConcurrency)
 	}
 
-	queriesGate := gate.NewKeeper(extprom.WrapRegistererWithPrefix("thanos_bucket_store_series_", reg)).NewGate(maxConcurrency)
-	promauto.With(reg).NewGauge(prometheus.GaugeOpts{
-		Name: "thanos_bucket_store_queries_concurrent_max",
-		Help: "Number of maximum concurrent queries.",
-	}).Set(float64(maxConcurrency))
+	queriesGate := gate.New(extprom.WrapRegistererWithPrefix("thanos_bucket_store_series_", reg), maxConcurrency)
 
 	bs, err := store.NewBucketStore(
 		logger,
@@ -349,7 +345,8 @@ func runStore(
 			return errors.Wrap(err, "setup gRPC server")
 		}
 
-		s := grpcserver.New(logger, reg, tracer, component, grpcProbe, bs, nil,
+		s := grpcserver.New(logger, reg, tracer, component, grpcProbe,
+			grpcserver.WithServer(store.RegisterStoreServer(bs)),
 			grpcserver.WithListen(grpcBindAddr),
 			grpcserver.WithGracePeriod(grpcGracePeriod),
 			grpcserver.WithTLSConfig(tlsCfg),

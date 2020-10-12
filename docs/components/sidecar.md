@@ -85,7 +85,7 @@ To use this, the Prometheus compaction needs to be disabled. This can be done by
 ```$
 usage: thanos sidecar [<flags>]
 
-sidecar for Prometheus server
+Sidecar for Prometheus server
 
 Flags:
   -h, --help                     Show context-sensitive help (also try
@@ -97,12 +97,12 @@ Flags:
       --tracing.config-file=<file-path>
                                  Path to YAML file with tracing configuration.
                                  See format details:
-                                 https://thanos.io/tip/tracing.md/#configuration
+                                 https://thanos.io/tip/thanos/tracing.md/#configuration
       --tracing.config=<content>
                                  Alternative to 'tracing.config-file' flag
                                  (lower priority). Content of YAML file with
                                  tracing configuration. See format details:
-                                 https://thanos.io/tip/tracing.md/#configuration
+                                 https://thanos.io/tip/thanos/tracing.md/#configuration
       --http-address="0.0.0.0:10902"
                                  Listen host:port for HTTP endpoints.
       --http-grace-period=2m     Time to wait after an interrupt received for

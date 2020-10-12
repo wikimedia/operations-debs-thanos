@@ -10,10 +10,12 @@ import (
 	"testing"
 
 	"github.com/cortexproject/cortex/pkg/querier/queryrange"
-	"github.com/thanos-io/thanos/pkg/compact"
-	"github.com/thanos-io/thanos/pkg/store/storepb"
-	"github.com/thanos-io/thanos/pkg/testutil"
+	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/weaveworks/common/httpgrpc"
+
+	queryv1 "github.com/thanos-io/thanos/pkg/api/query"
+	"github.com/thanos-io/thanos/pkg/compact"
+	"github.com/thanos-io/thanos/pkg/testutil"
 )
 
 func TestCodec_DecodeRequest(t *testing.T) {
@@ -95,7 +97,7 @@ func TestCodec_DecodeRequest(t *testing.T) {
 				MaxSourceResolution: 2000,
 				AutoDownsampling:    true,
 				Dedup:               true,
-				StoreMatchers:       [][]storepb.LabelMatcher{},
+				StoreMatchers:       [][]*labels.Matcher{},
 			},
 		},
 		{
@@ -115,7 +117,7 @@ func TestCodec_DecodeRequest(t *testing.T) {
 				Step:            1000,
 				Dedup:           true,
 				PartialResponse: true,
-				StoreMatchers:   [][]storepb.LabelMatcher{},
+				StoreMatchers:   [][]*labels.Matcher{},
 			},
 		},
 		{
@@ -129,7 +131,7 @@ func TestCodec_DecodeRequest(t *testing.T) {
 				Step:            1000,
 				Dedup:           true,
 				PartialResponse: true,
-				StoreMatchers:   [][]storepb.LabelMatcher{},
+				StoreMatchers:   [][]*labels.Matcher{},
 			},
 		},
 		{
@@ -143,7 +145,7 @@ func TestCodec_DecodeRequest(t *testing.T) {
 				Step:          1000,
 				Dedup:         true,
 				ReplicaLabels: []string{"foo", "bar"},
-				StoreMatchers: [][]storepb.LabelMatcher{},
+				StoreMatchers: [][]*labels.Matcher{},
 			},
 		},
 		{
@@ -156,10 +158,10 @@ func TestCodec_DecodeRequest(t *testing.T) {
 				End:   456000,
 				Step:  1000,
 				Dedup: true,
-				StoreMatchers: [][]storepb.LabelMatcher{
+				StoreMatchers: [][]*labels.Matcher{
 					{
-						storepb.LabelMatcher{Type: storepb.LabelMatcher_EQ, Name: "__address__", Value: "localhost:10901"},
-						storepb.LabelMatcher{Type: storepb.LabelMatcher_EQ, Name: "cluster", Value: "test"},
+						labels.MustNewMatcher(labels.MatchEqual, "__address__", "localhost:10901"),
+						labels.MustNewMatcher(labels.MatchEqual, "cluster", "test"),
 					},
 				},
 			},
@@ -218,7 +220,7 @@ func TestCodec_EncodeRequest(t *testing.T) {
 				return r.URL.Query().Get("start") == "123" &&
 					r.URL.Query().Get("end") == "456" &&
 					r.URL.Query().Get("step") == "1" &&
-					r.URL.Query().Get("dedup") == "true"
+					r.URL.Query().Get(queryv1.DedupParam) == "true"
 			},
 		},
 		{
@@ -233,7 +235,7 @@ func TestCodec_EncodeRequest(t *testing.T) {
 				return r.URL.Query().Get("start") == "123" &&
 					r.URL.Query().Get("end") == "456" &&
 					r.URL.Query().Get("step") == "1" &&
-					r.URL.Query().Get("partial_response") == "true"
+					r.URL.Query().Get(queryv1.PartialResponseParam) == "true"
 			},
 		},
 		{
@@ -248,7 +250,7 @@ func TestCodec_EncodeRequest(t *testing.T) {
 				return r.URL.Query().Get("start") == "123" &&
 					r.URL.Query().Get("end") == "456" &&
 					r.URL.Query().Get("step") == "1" &&
-					r.URL.Query().Get("max_source_resolution") == "300"
+					r.URL.Query().Get(queryv1.MaxSourceResolutionParam) == "300"
 			},
 		},
 		{
@@ -263,7 +265,7 @@ func TestCodec_EncodeRequest(t *testing.T) {
 				return r.URL.Query().Get("start") == "123" &&
 					r.URL.Query().Get("end") == "456" &&
 					r.URL.Query().Get("step") == "1" &&
-					r.URL.Query().Get("max_source_resolution") == "3600"
+					r.URL.Query().Get(queryv1.MaxSourceResolutionParam) == "3600"
 			},
 		},
 	} {
