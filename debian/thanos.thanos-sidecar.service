@@ -1,6 +1,6 @@
 [Unit]
 Description=Thanos sidecar
-Documentation=https://github.com/improbable-eng/thanos/
+Documentation=https://github.com/thanos-io/thanos/
 
 [Service]
 Restart=always
