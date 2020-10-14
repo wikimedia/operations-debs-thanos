@@ -1,7 +1,7 @@
 #!/usr/bin/make -f
 
 # Generate default files from command help
-# for c in sidecar store query compact receive; do
+# for c in sidecar store query compact receive rule query-frontend; do
 #   ./thanos $c --help 2>&1 | sed 's@^@# @' > debian/thanos.thanos-${c}.default
 # done
 
@@ -31,8 +31,7 @@ override_dh_auto_clean:
 override_dh_auto_test:
 
 override_dh_installinit:
-	dh_installinit --no-enable --name thanos-sidecar
-	dh_installinit --no-enable --name thanos-store
-	dh_installinit --no-enable --name thanos-query
-	dh_installinit --no-enable --name thanos-compact
-	dh_installinit --no-enable --name thanos-receive
+	for i in sidecar store query compact receive rule query-frontend; do \
+		dh_installinit --no-enable --name thanos-$$i ; \
+		dh_installsystemd --no-enable --no-start --name thanos-$$i ; \
+	done

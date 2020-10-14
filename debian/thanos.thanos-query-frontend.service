@@ -1,0 +1,15 @@
+[Unit]
+Description=Thanos query-frontend
+Documentation=https://github.com/thanos-io/thanos/
+
+[Service]
+Restart=always
+User=thanos
+EnvironmentFile=/etc/default/thanos-query-frontend
+ExecStart=/usr/bin/thanos query-frontend $ARGS
+ExecReload=/bin/kill -HUP $MAINPID
+TimeoutStopSec=20s
+SendSIGKILL=no
+
+[Install]
+WantedBy=multi-user.target
