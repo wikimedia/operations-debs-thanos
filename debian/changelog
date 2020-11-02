@@ -1,3 +1,9 @@
+thanos (0.16.0-2) buster-wikimedia; urgency=medium
+
+  * Pass SyslogIdentifier=%N to systemd services
+
+ -- Filippo Giunchedi <filippo@debian.org>  Mon, 02 Nov 2020 11:27:01 +0100
+
 thanos (0.16.0-1) buster-wikimedia; urgency=medium
 
   * New upstream release

@@ -10,6 +10,7 @@ ExecStart=/usr/bin/thanos sidecar $ARGS
 ExecReload=/bin/kill -HUP $MAINPID
 TimeoutStopSec=20s
 SendSIGKILL=no
+SyslogIdentifier=%N
 
 [Install]
 WantedBy=multi-user.target
