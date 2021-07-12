@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"sort"
 	"testing"
+	"time"
 
 	"github.com/gogo/protobuf/types"
 	"github.com/prometheus/prometheus/pkg/labels"
@@ -38,11 +39,10 @@ func allPostings(t testing.TB, ix tsdb.IndexReader) index.Postings {
 	return p
 }
 
-const RemoteReadFrameLimit = 1048576
-
 type HeadGenOptions struct {
 	TSDBDir                  string
 	SamplesPerSeries, Series int
+	ScrapeInterval           time.Duration
 
 	WithWAL       bool
 	PrependLabels labels.Labels
@@ -54,13 +54,22 @@ type HeadGenOptions struct {
 // CreateHeadWithSeries returns head filled with given samples and same series returned in separate list for assertion purposes.
 // Returned series list has "ext1"="1" prepended. Each series looks as follows:
 // {foo=bar,i=000001aaaaaaaaaabbbbbbbbbbccccccccccdddddddddd} <random value> where number indicate sample number from 0.
-// Returned series are frame in same way as remote read would frame them.
+// Returned series are framed in the same way as remote read would frame them.
 func CreateHeadWithSeries(t testing.TB, j int, opts HeadGenOptions) (*tsdb.Head, []*storepb.Series) {
 	if opts.SamplesPerSeries < 1 || opts.Series < 1 {
 		t.Fatal("samples and series has to be 1 or more")
 	}
+	if opts.ScrapeInterval == 0 {
+		opts.ScrapeInterval = 1 * time.Millisecond
+	}
 
-	fmt.Printf("Creating %d %d-sample series in %s\n", opts.Series, opts.SamplesPerSeries, opts.TSDBDir)
+	fmt.Printf(
+		"Creating %d %d-sample series with %s interval in %s\n",
+		opts.Series,
+		opts.SamplesPerSeries,
+		opts.ScrapeInterval.String(),
+		opts.TSDBDir,
+	)
 
 	var w *wal.WAL
 	var err error
@@ -71,17 +80,25 @@ func CreateHeadWithSeries(t testing.TB, j int, opts HeadGenOptions) (*tsdb.Head,
 		testutil.Ok(t, os.MkdirAll(filepath.Join(opts.TSDBDir, "wal"), os.ModePerm))
 	}
 
-	h, err := tsdb.NewHead(nil, nil, w, tsdb.DefaultBlockDuration, opts.TSDBDir, nil, tsdb.DefaultStripeSize, nil)
+	headOpts := tsdb.DefaultHeadOptions()
+	headOpts.ChunkDirRoot = opts.TSDBDir
+	h, err := tsdb.NewHead(nil, nil, w, headOpts)
 	testutil.Ok(t, err)
 
 	app := h.Appender(context.Background())
 	for i := 0; i < opts.Series; i++ {
-		ts := int64(j*opts.Series*opts.SamplesPerSeries + i*opts.SamplesPerSeries)
-		ref, err := app.Add(labels.FromStrings("foo", "bar", "i", fmt.Sprintf("%07d%s", ts, LabelLongSuffix)), ts, opts.Random.Float64())
+		tsLabel := j*opts.Series*opts.SamplesPerSeries + i*opts.SamplesPerSeries
+		ref, err := app.Append(
+			0,
+			labels.FromStrings("foo", "bar", "i", fmt.Sprintf("%07d%s", tsLabel, LabelLongSuffix)),
+			int64(tsLabel)*opts.ScrapeInterval.Milliseconds(),
+			opts.Random.Float64(),
+		)
 		testutil.Ok(t, err)
 
 		for is := 1; is < opts.SamplesPerSeries; is++ {
-			testutil.Ok(t, app.AddFast(ref, ts+int64(is), opts.Random.Float64()))
+			_, err := app.Append(ref, nil, int64(tsLabel+is)*opts.ScrapeInterval.Milliseconds(), opts.Random.Float64())
+			testutil.Ok(t, err)
 		}
 	}
 	testutil.Ok(t, app.Commit())
@@ -104,7 +121,7 @@ func CreateHeadWithSeries(t testing.TB, j int, opts HeadGenOptions) (*tsdb.Head,
 	all := allPostings(t, ir)
 	for all.Next() {
 		testutil.Ok(t, ir.Series(all.At(), &lset, &chunkMetas))
-		expected = append(expected, &storepb.Series{Labels: labelpb.LabelsFromPromLabels(append(opts.PrependLabels.Copy(), lset...))})
+		expected = append(expected, &storepb.Series{Labels: labelpb.ZLabelsFromPromLabels(append(opts.PrependLabels.Copy(), lset...))})
 
 		if opts.SkipChunks {
 			continue
@@ -235,10 +252,14 @@ func TestServerSeries(t testutil.TB, store storepb.StoreServer, cases ...*Series
 					if len(c.ExpectedSeries) > 4 {
 						for j := range c.ExpectedSeries {
 							testutil.Equals(t, c.ExpectedSeries[j].Labels, srv.SeriesSet[j].Labels, "%v series chunks mismatch", j)
-							if len(c.ExpectedSeries[j].Chunks) > 20 {
-								testutil.Equals(t, len(c.ExpectedSeries[j].Chunks), len(srv.SeriesSet[j].Chunks), "%v series chunks number mismatch", j)
+
+							// Check chunks when it is not a skip chunk query
+							if !c.Req.SkipChunks {
+								if len(c.ExpectedSeries[j].Chunks) > 20 {
+									testutil.Equals(t, len(c.ExpectedSeries[j].Chunks), len(srv.SeriesSet[j].Chunks), "%v series chunks number mismatch", j)
+								}
+								testutil.Equals(t, c.ExpectedSeries[j].Chunks, srv.SeriesSet[j].Chunks, "%v series chunks mismatch", j)
 							}
-							testutil.Equals(t, c.ExpectedSeries[j].Chunks, srv.SeriesSet[j].Chunks, "%v series chunks mismatch", j)
 						}
 					} else {
 						testutil.Equals(t, c.ExpectedSeries, srv.SeriesSet)

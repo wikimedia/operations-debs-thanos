@@ -9,12 +9,11 @@ import (
 	"sort"
 	"sync"
 
-	"github.com/cespare/xxhash"
 	"github.com/pkg/errors"
+	"github.com/thanos-io/thanos/pkg/store/labelpb"
+
 	"github.com/thanos-io/thanos/pkg/store/storepb/prompb"
 )
-
-const sep = '\xff'
 
 // insufficientNodesError is returned when a hashring does not
 // have enough nodes to satisfy a request for a node.
@@ -36,23 +35,6 @@ type Hashring interface {
 	Get(tenant string, timeSeries *prompb.TimeSeries) (string, error)
 	// GetN returns the nth node that should handle the given tenant and time series.
 	GetN(tenant string, timeSeries *prompb.TimeSeries, n uint64) (string, error)
-}
-
-// hash returns a hash for the given tenant and time series.
-func hash(tenant string, ts *prompb.TimeSeries) uint64 {
-	// Sort labelset to ensure a stable hash.
-	sort.Slice(ts.Labels, func(i, j int) bool { return ts.Labels[i].Name < ts.Labels[j].Name })
-
-	b := make([]byte, 0, 1024)
-	b = append(b, []byte(tenant)...)
-	b = append(b, sep)
-	for _, v := range ts.Labels {
-		b = append(b, v.Name...)
-		b = append(b, sep)
-		b = append(b, v.Value...)
-		b = append(b, sep)
-	}
-	return xxhash.Sum64(b)
 }
 
 // SingleNodeHashring always returns the same node.
@@ -84,7 +66,10 @@ func (s simpleHashring) GetN(tenant string, ts *prompb.TimeSeries, n uint64) (st
 	if n >= uint64(len(s)) {
 		return "", &insufficientNodesError{have: uint64(len(s)), want: n + 1}
 	}
-	return s[(hash(tenant, ts)+n)%uint64(len(s))], nil
+
+	sort.Slice(ts.Labels, func(i, j int) bool { return ts.Labels[i].Name < ts.Labels[j].Name })
+
+	return s[(labelpb.HashWithPrefix(tenant, ts.Labels)+n)%uint64(len(s))], nil
 }
 
 // multiHashring represents a set of hashrings.
@@ -158,14 +143,14 @@ func newMultiHashring(cfg []HashringConfig) Hashring {
 	return m
 }
 
-// HashringFromConfig creates multi-tenant hashrings from a
+// HashringFromConfigWatcher creates multi-tenant hashrings from a
 // hashring configuration file watcher.
 // The configuration file is watched for updates.
 // Hashrings are returned on the updates channel.
 // Which hashring to use for a tenant is determined
 // by the tenants field of the hashring configuration.
 // The updates chan is closed before exiting.
-func HashringFromConfig(ctx context.Context, updates chan<- Hashring, cw *ConfigWatcher) error {
+func HashringFromConfigWatcher(ctx context.Context, updates chan<- Hashring, cw *ConfigWatcher) error {
 	defer close(updates)
 	go cw.Run(ctx)
 
@@ -180,4 +165,19 @@ func HashringFromConfig(ctx context.Context, updates chan<- Hashring, cw *Config
 			return ctx.Err()
 		}
 	}
+}
+
+// HashringFromConfig loads raw configuration content and returns a Hashring if the given configuration is not valid.
+func HashringFromConfig(content string) (Hashring, error) {
+	config, err := parseConfig([]byte(content))
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to parse configuration")
+	}
+
+	// If hashring is empty, return an error.
+	if len(config) == 0 {
+		return nil, errors.Wrapf(err, "failed to load configuration")
+	}
+
+	return newMultiHashring(config), err
 }

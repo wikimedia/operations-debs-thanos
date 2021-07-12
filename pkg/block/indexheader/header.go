@@ -18,7 +18,7 @@ type Reader interface {
 	io.Closer
 
 	// IndexVersion returns version of index.
-	IndexVersion() int
+	IndexVersion() (int, error)
 
 	// PostingsOffset returns start and end offsets of postings for given name and value.
 	// The end offset might be bigger than the actual posting ending, but not larger than the whole index file.
@@ -35,6 +35,6 @@ type Reader interface {
 	// then empty string is returned and no error.
 	LabelValues(name string) ([]string, error)
 
-	// LabelNames returns all label names.
-	LabelNames() []string
+	// LabelNames returns all label names in sorted order.
+	LabelNames() ([]string, error)
 }

@@ -56,15 +56,17 @@ func testMeta(ulid ulid.ULID) *metadata.Meta {
 			Compaction: tsdb.BlockMetaCompaction{
 				Level: 1,
 			},
-			Version: metadata.MetaVersion1,
+			Version: metadata.TSDBVersion1,
 		},
 	}
 }
 
 func TestReplicationSchemeAll(t *testing.T) {
+	testBlockID := testULID(0)
 	var cases = []struct {
 		name     string
 		selector labels.Selector
+		blockIDs []ulid.ULID
 		prepare  func(ctx context.Context, t *testing.T, originBucket, targetBucket *objstore.InMemBucket)
 		assert   func(ctx context.Context, t *testing.T, originBucket, targetBucket *objstore.InMemBucket)
 	}{
@@ -291,6 +293,35 @@ func TestReplicationSchemeAll(t *testing.T) {
 				testutil.Equals(t, expected, got)
 			},
 		},
+		{
+			name:     "BlockIDs",
+			blockIDs: []ulid.ULID{testBlockID},
+			prepare: func(ctx context.Context, t *testing.T, originBucket, targetBucket *objstore.InMemBucket) {
+				meta := testMeta(testBlockID)
+
+				b, err := json.Marshal(meta)
+				testutil.Ok(t, err)
+				_ = originBucket.Upload(ctx, path.Join(testBlockID.String(), "meta.json"), bytes.NewReader(b))
+				_ = originBucket.Upload(ctx, path.Join(testBlockID.String(), "chunks", "000001"), bytes.NewReader(nil))
+				_ = originBucket.Upload(ctx, path.Join(testBlockID.String(), "index"), bytes.NewReader(nil))
+
+				ulid := testULID(1)
+				meta = testMeta(ulid)
+
+				b, err = json.Marshal(meta)
+				testutil.Ok(t, err)
+				_ = originBucket.Upload(ctx, path.Join(ulid.String(), "meta.json"), bytes.NewReader(b))
+				_ = originBucket.Upload(ctx, path.Join(ulid.String(), "chunks", "000001"), bytes.NewReader(nil))
+				_ = originBucket.Upload(ctx, path.Join(ulid.String(), "index"), bytes.NewReader(nil))
+			},
+			assert: func(ctx context.Context, t *testing.T, originBucket, targetBucket *objstore.InMemBucket) {
+				expected := 3
+				got := len(targetBucket.Objects())
+				if got != expected {
+					t.Fatalf("TargetBucket should have one block made up of three objects replicated. Got %d but expected %d objects.", got, expected)
+				}
+			},
+		},
 	}
 
 	for _, c := range cases {
@@ -311,19 +342,11 @@ func TestReplicationSchemeAll(t *testing.T) {
 			selector = c.selector
 		}
 
-		filter := NewBlockFilter(logger, selector, []compact.ResolutionLevel{compact.ResolutionLevelRaw}, []int{1}).Filter
+		filter := NewBlockFilter(logger, selector, []compact.ResolutionLevel{compact.ResolutionLevelRaw}, []int{1}, c.blockIDs).Filter
 		fetcher, err := block.NewMetaFetcher(logger, 32, objstore.WithNoopInstr(originBucket), "", nil, nil, nil)
 		testutil.Ok(t, err)
 
-		r := newReplicationScheme(
-			logger,
-			newReplicationMetrics(nil),
-			filter,
-			fetcher,
-			objstore.WithNoopInstr(originBucket),
-			targetBucket,
-			nil,
-		)
+		r := newReplicationScheme(logger, newReplicationMetrics(nil), filter, fetcher, objstore.WithNoopInstr(originBucket), targetBucket, nil)
 
 		err = r.execute(ctx)
 		testutil.Ok(t, err)

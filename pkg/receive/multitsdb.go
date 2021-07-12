@@ -18,15 +18,16 @@ import (
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb"
-	terrors "github.com/prometheus/prometheus/tsdb/errors"
-	"golang.org/x/sync/errgroup"
-
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 	"github.com/thanos-io/thanos/pkg/component"
+	"github.com/thanos-io/thanos/pkg/errutil"
 	"github.com/thanos-io/thanos/pkg/objstore"
 	"github.com/thanos-io/thanos/pkg/shipper"
 	"github.com/thanos-io/thanos/pkg/store"
+	"github.com/thanos-io/thanos/pkg/store/labelpb"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
+	"go.uber.org/atomic"
+	"golang.org/x/sync/errgroup"
 )
 
 type MultiTSDB struct {
@@ -41,8 +42,11 @@ type MultiTSDB struct {
 	mtx                   *sync.RWMutex
 	tenants               map[string]*tenant
 	allowOutOfOrderUpload bool
+	hashFunc              metadata.HashFunc
 }
 
+// NewMultiTSDB creates new MultiTSDB.
+// NOTE: Passed labels has to be sorted by name.
 func NewMultiTSDB(
 	dataDir string,
 	l log.Logger,
@@ -52,6 +56,7 @@ func NewMultiTSDB(
 	tenantLabelName string,
 	bucket objstore.Bucket,
 	allowOutOfOrderUpload bool,
+	hashFunc metadata.HashFunc,
 ) *MultiTSDB {
 	if l == nil {
 		l = log.NewNopLogger()
@@ -68,6 +73,7 @@ func NewMultiTSDB(
 		tenantLabelName:       tenantLabelName,
 		bucket:                bucket,
 		allowOutOfOrderUpload: allowOutOfOrderUpload,
+		hashFunc:              hashFunc,
 	}
 }
 
@@ -111,7 +117,7 @@ func (t *tenant) set(storeTSDB *store.TSDBStore, tenantTSDB *tsdb.DB, ship *ship
 }
 
 func (t *MultiTSDB) Open() error {
-	if err := os.MkdirAll(t.dataDir, 0777); err != nil {
+	if err := os.MkdirAll(t.dataDir, 0750); err != nil {
 		return err
 	}
 
@@ -141,7 +147,7 @@ func (t *MultiTSDB) Flush() error {
 	defer t.mtx.RUnlock()
 
 	errmtx := &sync.Mutex{}
-	merr := terrors.MultiError{}
+	merr := errutil.MultiError{}
 	wg := &sync.WaitGroup{}
 	for id, tenant := range t.tenants {
 		db := tenant.readyStorage().Get()
@@ -170,7 +176,7 @@ func (t *MultiTSDB) Close() error {
 	t.mtx.Lock()
 	defer t.mtx.Unlock()
 
-	merr := terrors.MultiError{}
+	merr := errutil.MultiError{}
 	for id, tenant := range t.tenants {
 		db := tenant.readyStorage().Get()
 		if db == nil {
@@ -183,17 +189,21 @@ func (t *MultiTSDB) Close() error {
 	return merr.Err()
 }
 
-func (t *MultiTSDB) Sync(ctx context.Context) error {
+func (t *MultiTSDB) Sync(ctx context.Context) (int, error) {
 	if t.bucket == nil {
-		return errors.New("bucket is not specified, Sync should not be invoked")
+		return 0, errors.New("bucket is not specified, Sync should not be invoked")
 	}
 
 	t.mtx.RLock()
 	defer t.mtx.RUnlock()
 
-	errmtx := &sync.Mutex{}
-	merr := terrors.MultiError{}
-	wg := &sync.WaitGroup{}
+	var (
+		errmtx   = &sync.Mutex{}
+		merr     = errutil.MultiError{}
+		wg       = &sync.WaitGroup{}
+		uploaded atomic.Int64
+	)
+
 	for tenantID, tenant := range t.tenants {
 		level.Debug(t.logger).Log("msg", "uploading block for tenant", "tenant", tenantID)
 		s := tenant.shipper()
@@ -202,16 +212,18 @@ func (t *MultiTSDB) Sync(ctx context.Context) error {
 		}
 		wg.Add(1)
 		go func() {
-			if uploaded, err := s.Sync(ctx); err != nil {
+			up, err := s.Sync(ctx)
+			if err != nil {
 				errmtx.Lock()
-				merr.Add(errors.Wrapf(err, "upload %d", uploaded))
+				merr.Add(errors.Wrap(err, "upload"))
 				errmtx.Unlock()
 			}
+			uploaded.Add(int64(up))
 			wg.Done()
 		}()
 	}
 	wg.Wait()
-	return merr.Err()
+	return int(uploaded.Load()), merr.Err()
 }
 
 func (t *MultiTSDB) RemoveLockFilesIfAny() error {
@@ -223,7 +235,7 @@ func (t *MultiTSDB) RemoveLockFilesIfAny() error {
 		return err
 	}
 
-	merr := terrors.MultiError{}
+	merr := errutil.MultiError{}
 	for _, fi := range fis {
 		if !fi.IsDir() {
 			continue
@@ -256,7 +268,7 @@ func (t *MultiTSDB) TSDBStores() map[string]storepb.StoreServer {
 
 func (t *MultiTSDB) startTSDB(logger log.Logger, tenantID string, tenant *tenant) error {
 	reg := prometheus.WrapRegistererWith(prometheus.Labels{"tenant": tenantID}, t.reg)
-	lbls := append(t.labels, labels.Label{Name: t.tenantLabelName, Value: tenantID})
+	lset := labelpb.ExtendSortedLabels(t.labels, labels.FromStrings(t.tenantLabelName, tenantID))
 	dataDir := t.defaultTenantDataDir(tenantID)
 
 	level.Info(logger).Log("msg", "opening TSDB")
@@ -280,13 +292,14 @@ func (t *MultiTSDB) startTSDB(logger log.Logger, tenantID string, tenant *tenant
 			reg,
 			dataDir,
 			t.bucket,
-			func() labels.Labels { return lbls },
+			func() labels.Labels { return lset },
 			metadata.ReceiveSource,
 			false,
 			t.allowOutOfOrderUpload,
+			t.hashFunc,
 		)
 	}
-	tenant.set(store.NewTSDBStore(logger, reg, s, component.Receive, lbls), s, ship)
+	tenant.set(store.NewTSDBStore(logger, s, component.Receive, lset), s, ship)
 	level.Info(logger).Log("msg", "TSDB is now ready")
 	return nil
 }

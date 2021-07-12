@@ -9,6 +9,8 @@ import (
 	"sort"
 	"testing"
 
+	"github.com/go-kit/kit/log"
+
 	"github.com/pkg/errors"
 	"github.com/thanos-io/thanos/pkg/testutil"
 )
@@ -31,6 +33,10 @@ func (m mockHostnameResolver) LookupSRV(ctx context.Context, service, proto, nam
 		return "", nil, m.err
 	}
 	return "", m.resultSRVs[name], nil
+}
+
+func (m mockHostnameResolver) IsNotFound(err error) bool {
+	return false
 }
 
 type DNSSDTest struct {
@@ -184,7 +190,7 @@ func TestDnsSD_Resolve(t *testing.T) {
 
 func testDnsSd(t *testing.T, tt DNSSDTest) {
 	ctx := context.TODO()
-	dnsSD := dnsSD{tt.resolver}
+	dnsSD := dnsSD{tt.resolver, log.NewNopLogger()}
 
 	result, err := dnsSD.Resolve(ctx, tt.addr, tt.qtype)
 	if tt.expectedErr != nil {

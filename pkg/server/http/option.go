@@ -4,12 +4,15 @@
 package http
 
 import (
+	"net/http"
 	"time"
 )
 
 type options struct {
-	gracePeriod time.Duration
-	listen      string
+	gracePeriod   time.Duration
+	listen        string
+	tlsConfigPath string
+	mux           *http.ServeMux
 }
 
 // Option overrides behavior of Server.
@@ -36,5 +39,18 @@ func WithGracePeriod(t time.Duration) Option {
 func WithListen(s string) Option {
 	return optionFunc(func(o *options) {
 		o.listen = s
+	})
+}
+
+func WithTLSConfig(tls string) Option {
+	return optionFunc(func(o *options) {
+		o.tlsConfigPath = tls
+	})
+}
+
+// WithMux overrides the the server's default mux.
+func WithMux(mux *http.ServeMux) Option {
+	return optionFunc(func(o *options) {
+		o.mux = mux
 	})
 }

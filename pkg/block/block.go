@@ -14,6 +14,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -42,14 +43,44 @@ const (
 	DebugMetas = "debug/metas"
 )
 
-// Download downloads directory that is mean to be block directory.
+// Download downloads directory that is mean to be block directory. If any of the files
+// have a hash calculated in the meta file and it matches with what is in the destination path then
+// we do not download it. We always re-download the meta file.
 func Download(ctx context.Context, logger log.Logger, bucket objstore.Bucket, id ulid.ULID, dst string) error {
-	if err := objstore.DownloadDir(ctx, logger, bucket, id.String(), dst); err != nil {
+	if err := os.MkdirAll(dst, 0750); err != nil {
+		return errors.Wrap(err, "create dir")
+	}
+
+	if err := objstore.DownloadFile(ctx, logger, bucket, path.Join(id.String(), MetaFilename), path.Join(dst, MetaFilename)); err != nil {
+		return err
+	}
+	m, err := metadata.ReadFromDir(dst)
+	if err != nil {
+		return errors.Wrapf(err, "reading meta from %s", dst)
+	}
+
+	ignoredPaths := []string{MetaFilename}
+	for _, fl := range m.Thanos.Files {
+		if fl.Hash == nil || fl.Hash.Func == metadata.NoneFunc || fl.RelPath == "" {
+			continue
+		}
+		actualHash, err := metadata.CalculateHash(filepath.Join(dst, fl.RelPath), fl.Hash.Func, logger)
+		if err != nil {
+			level.Info(logger).Log("msg", "failed to calculate hash when downloading; re-downloading", "relPath", fl.RelPath, "err", err)
+			continue
+		}
+
+		if fl.Hash.Equal(&actualHash) {
+			ignoredPaths = append(ignoredPaths, fl.RelPath)
+		}
+	}
+
+	if err := objstore.DownloadDir(ctx, logger, bucket, id.String(), id.String(), dst, ignoredPaths...); err != nil {
 		return err
 	}
 
 	chunksDir := filepath.Join(dst, ChunksDirname)
-	_, err := os.Stat(chunksDir)
+	_, err = os.Stat(chunksDir)
 	if os.IsNotExist(err) {
 		// This can happen if block is empty. We cannot easily upload empty directory, so create one here.
 		return os.Mkdir(chunksDir, os.ModePerm)
@@ -62,11 +93,23 @@ func Download(ctx context.Context, logger log.Logger, bucket objstore.Bucket, id
 	return nil
 }
 
-// Upload uploads block from given block dir that ends with block id.
+// Upload uploads a TSDB block to the object storage. It verifies basic
+// features of Thanos block.
+func Upload(ctx context.Context, logger log.Logger, bkt objstore.Bucket, bdir string, hf metadata.HashFunc) error {
+	return upload(ctx, logger, bkt, bdir, hf, true)
+}
+
+// UploadPromBlock uploads a TSDB block to the object storage. It assumes
+// the block is used in Prometheus so it doesn't check Thanos external labels.
+func UploadPromBlock(ctx context.Context, logger log.Logger, bkt objstore.Bucket, bdir string, hf metadata.HashFunc) error {
+	return upload(ctx, logger, bkt, bdir, hf, false)
+}
+
+// upload uploads block from given block dir that ends with block id.
 // It makes sure cleanup is done on error to avoid partial block uploads.
-// It also verifies basic features of Thanos block.
 // TODO(bplotka): Ensure bucket operations have reasonable backoff retries.
-func Upload(ctx context.Context, logger log.Logger, bkt objstore.Bucket, bdir string) error {
+// NOTE: Upload updates `meta.Thanos.File` section.
+func upload(ctx context.Context, logger log.Logger, bkt objstore.Bucket, bdir string, hf metadata.HashFunc, checkExternalLabels bool) error {
 	df, err := os.Stat(bdir)
 	if err != nil {
 		return err
@@ -81,18 +124,31 @@ func Upload(ctx context.Context, logger log.Logger, bkt objstore.Bucket, bdir st
 		return errors.Wrap(err, "not a block dir")
 	}
 
-	meta, err := metadata.Read(bdir)
+	meta, err := metadata.ReadFromDir(bdir)
 	if err != nil {
 		// No meta or broken meta file.
 		return errors.Wrap(err, "read meta")
 	}
 
-	if meta.Thanos.Labels == nil || len(meta.Thanos.Labels) == 0 {
-		return errors.New("empty external labels are not allowed for Thanos block.")
+	if checkExternalLabels {
+		if meta.Thanos.Labels == nil || len(meta.Thanos.Labels) == 0 {
+			return errors.New("empty external labels are not allowed for Thanos block.")
+		}
 	}
 
-	if err := objstore.UploadFile(ctx, logger, bkt, path.Join(bdir, MetaFilename), path.Join(DebugMetas, fmt.Sprintf("%s.json", id))); err != nil {
-		return errors.Wrap(err, "upload meta file to debug dir")
+	metaEncoded := strings.Builder{}
+	meta.Thanos.Files, err = gatherFileStats(bdir, hf, logger)
+	if err != nil {
+		return errors.Wrap(err, "gather meta file stats")
+	}
+
+	if err := meta.Write(&metaEncoded); err != nil {
+		return errors.Wrap(err, "encode meta file")
+	}
+
+	// TODO(yeya24): Remove this step.
+	if err := bkt.Upload(ctx, path.Join(DebugMetas, fmt.Sprintf("%s.json", id)), strings.NewReader(metaEncoded.String())); err != nil {
+		return cleanUp(logger, bkt, id, errors.Wrap(err, "upload debug meta file"))
 	}
 
 	if err := objstore.UploadDir(ctx, logger, bkt, path.Join(bdir, ChunksDirname), path.Join(id.String(), ChunksDirname)); err != nil {
@@ -103,10 +159,13 @@ func Upload(ctx context.Context, logger log.Logger, bkt objstore.Bucket, bdir st
 		return cleanUp(logger, bkt, id, errors.Wrap(err, "upload index"))
 	}
 
-	// Meta.json always need to be uploaded as a last item. This will allow to assume block directories without meta file
-	// to be pending uploads.
-	if err := objstore.UploadFile(ctx, logger, bkt, path.Join(bdir, MetaFilename), path.Join(id.String(), MetaFilename)); err != nil {
-		return cleanUp(logger, bkt, id, errors.Wrap(err, "upload meta file"))
+	// Meta.json always need to be uploaded as a last item. This will allow to assume block directories without meta file to be pending uploads.
+	if err := bkt.Upload(ctx, path.Join(id.String(), MetaFilename), strings.NewReader(metaEncoded.String())); err != nil {
+		// Don't call cleanUp here. Despite getting error, meta.json may have been uploaded in certain cases,
+		// and even though cleanUp will not see it yet, meta.json may appear in the bucket later.
+		// (Eg. S3 is known to behave this way when it returns 503 "SlowDown" error).
+		// If meta.json is not uploaded, this will produce partial blocks, but such blocks will be cleaned later.
+		return errors.Wrap(err, "upload meta file")
 	}
 
 	return nil
@@ -122,7 +181,7 @@ func cleanUp(logger log.Logger, bkt objstore.Bucket, id ulid.ULID, err error) er
 }
 
 // MarkForDeletion creates a file which stores information about when the block was marked for deletion.
-func MarkForDeletion(ctx context.Context, logger log.Logger, bkt objstore.Bucket, id ulid.ULID, markedForDeletion prometheus.Counter) error {
+func MarkForDeletion(ctx context.Context, logger log.Logger, bkt objstore.Bucket, id ulid.ULID, details string, markedForDeletion prometheus.Counter) error {
 	deletionMarkFile := path.Join(id.String(), metadata.DeletionMarkFilename)
 	deletionMarkExists, err := bkt.Exists(ctx, deletionMarkFile)
 	if err != nil {
@@ -137,6 +196,7 @@ func MarkForDeletion(ctx context.Context, logger log.Logger, bkt objstore.Bucket
 		ID:           id,
 		DeletionTime: time.Now().Unix(),
 		Version:      metadata.DeletionMarkVersion1,
+		Details:      details,
 	})
 	if err != nil {
 		return errors.Wrap(err, "json encode deletion mark")
@@ -152,12 +212,15 @@ func MarkForDeletion(ctx context.Context, logger log.Logger, bkt objstore.Bucket
 
 // Delete removes directory that is meant to be block directory.
 // NOTE: Always prefer this method for deleting blocks.
-//  * We have to delete block's files in the certain order (meta.json first)
+//  * We have to delete block's files in the certain order (meta.json first and deletion-mark.json last)
 //  to ensure we don't end up with malformed partial blocks. Thanos system handles well partial blocks
 //  only if they don't have meta.json. If meta.json is present Thanos assumes valid block.
 //  * This avoids deleting empty dir (whole bucket) by mistake.
 func Delete(ctx context.Context, logger log.Logger, bkt objstore.Bucket, id ulid.ULID) error {
 	metaFile := path.Join(id.String(), MetaFilename)
+	deletionMarkFile := path.Join(id.String(), metadata.DeletionMarkFilename)
+
+	// Delete block meta file.
 	ok, err := bkt.Exists(ctx, metaFile)
 	if err != nil {
 		return errors.Wrapf(err, "stat %s", metaFile)
@@ -170,10 +233,30 @@ func Delete(ctx context.Context, logger log.Logger, bkt objstore.Bucket, id ulid
 		level.Debug(logger).Log("msg", "deleted file", "file", metaFile, "bucket", bkt.Name())
 	}
 
-	// Delete the bucket, but skip the metaFile as we just deleted that. This is required for eventual object storages (list after write).
-	return deleteDirRec(ctx, logger, bkt, id.String(), func(name string) bool {
-		return name == metaFile
+	// Delete the block objects, but skip:
+	// - The metaFile as we just deleted. This is required for eventual object storages (list after write).
+	// - The deletionMarkFile as we'll delete it at last.
+	err = deleteDirRec(ctx, logger, bkt, id.String(), func(name string) bool {
+		return name == metaFile || name == deletionMarkFile
 	})
+	if err != nil {
+		return err
+	}
+
+	// Delete block deletion mark.
+	ok, err = bkt.Exists(ctx, deletionMarkFile)
+	if err != nil {
+		return errors.Wrapf(err, "stat %s", deletionMarkFile)
+	}
+
+	if ok {
+		if err := bkt.Delete(ctx, deletionMarkFile); err != nil {
+			return errors.Wrapf(err, "delete %s", deletionMarkFile)
+		}
+		level.Debug(logger).Log("msg", "deleted file", "file", deletionMarkFile, "bucket", bkt.Name())
+	}
+
+	return nil
 }
 
 // deleteDirRec removes all objects prefixed with dir from the bucket. It skips objects that return true for the passed keep function.
@@ -221,4 +304,103 @@ func DownloadMeta(ctx context.Context, logger log.Logger, bkt objstore.Bucket, i
 func IsBlockDir(path string) (id ulid.ULID, ok bool) {
 	id, err := ulid.Parse(filepath.Base(path))
 	return id, err == nil
+}
+
+// GetSegmentFiles returns list of segment files for given block. Paths are relative to the chunks directory.
+// In case of errors, nil is returned.
+func GetSegmentFiles(blockDir string) []string {
+	files, err := ioutil.ReadDir(filepath.Join(blockDir, ChunksDirname))
+	if err != nil {
+		return nil
+	}
+
+	// ReadDir returns files in sorted order already.
+	var result []string
+	for _, f := range files {
+		result = append(result, f.Name())
+	}
+	return result
+}
+
+// TODO(bwplotka): Gather stats when dirctly uploading files.
+func gatherFileStats(blockDir string, hf metadata.HashFunc, logger log.Logger) (res []metadata.File, _ error) {
+	files, err := ioutil.ReadDir(filepath.Join(blockDir, ChunksDirname))
+	if err != nil {
+		return nil, errors.Wrapf(err, "read dir %v", filepath.Join(blockDir, ChunksDirname))
+	}
+	for _, f := range files {
+		mf := metadata.File{
+			RelPath:   filepath.Join(ChunksDirname, f.Name()),
+			SizeBytes: f.Size(),
+		}
+		if hf != metadata.NoneFunc && !f.IsDir() {
+			h, err := metadata.CalculateHash(filepath.Join(blockDir, ChunksDirname, f.Name()), hf, logger)
+			if err != nil {
+				return nil, errors.Wrapf(err, "calculate hash %v", filepath.Join(ChunksDirname, f.Name()))
+			}
+			mf.Hash = &h
+		}
+		res = append(res, mf)
+	}
+
+	indexFile, err := os.Stat(filepath.Join(blockDir, IndexFilename))
+	if err != nil {
+		return nil, errors.Wrapf(err, "stat %v", filepath.Join(blockDir, IndexFilename))
+	}
+	mf := metadata.File{
+		RelPath:   indexFile.Name(),
+		SizeBytes: indexFile.Size(),
+	}
+	if hf != metadata.NoneFunc {
+		h, err := metadata.CalculateHash(filepath.Join(blockDir, IndexFilename), hf, logger)
+		if err != nil {
+			return nil, errors.Wrapf(err, "calculate hash %v", indexFile.Name())
+		}
+		mf.Hash = &h
+	}
+	res = append(res, mf)
+
+	metaFile, err := os.Stat(filepath.Join(blockDir, MetaFilename))
+	if err != nil {
+		return nil, errors.Wrapf(err, "stat %v", filepath.Join(blockDir, MetaFilename))
+	}
+	res = append(res, metadata.File{RelPath: metaFile.Name()})
+
+	sort.Slice(res, func(i, j int) bool {
+		return strings.Compare(res[i].RelPath, res[j].RelPath) < 0
+	})
+	// TODO(bwplotka): Add optional files like tombstones?
+	return res, err
+}
+
+// MarkForNoCompact creates a file which marks block to be not compacted.
+func MarkForNoCompact(ctx context.Context, logger log.Logger, bkt objstore.Bucket, id ulid.ULID, reason metadata.NoCompactReason, details string, markedForNoCompact prometheus.Counter) error {
+	m := path.Join(id.String(), metadata.NoCompactMarkFilename)
+	noCompactMarkExists, err := bkt.Exists(ctx, m)
+	if err != nil {
+		return errors.Wrapf(err, "check exists %s in bucket", m)
+	}
+	if noCompactMarkExists {
+		level.Warn(logger).Log("msg", "requested to mark for no compaction, but file already exists; this should not happen; investigate", "err", errors.Errorf("file %s already exists in bucket", m))
+		return nil
+	}
+
+	noCompactMark, err := json.Marshal(metadata.NoCompactMark{
+		ID:      id,
+		Version: metadata.NoCompactMarkVersion1,
+
+		NoCompactTime: time.Now().Unix(),
+		Reason:        reason,
+		Details:       details,
+	})
+	if err != nil {
+		return errors.Wrap(err, "json encode no compact mark")
+	}
+
+	if err := bkt.Upload(ctx, m, bytes.NewBuffer(noCompactMark)); err != nil {
+		return errors.Wrapf(err, "upload file %s to bucket", m)
+	}
+	markedForNoCompact.Inc()
+	level.Info(logger).Log("msg", "block has been marked for no compaction", "block", id)
+	return nil
 }

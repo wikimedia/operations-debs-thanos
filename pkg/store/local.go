@@ -68,8 +68,8 @@ func NewLocalStoreFromJSONMmappableFile(
 		extLabels: extLabels,
 		c:         f,
 		info: &storepb.InfoResponse{
-			LabelSets: []storepb.LabelSet{
-				{Labels: labelpb.LabelsFromPromLabels(extLabels)},
+			LabelSets: []labelpb.ZLabelSet{
+				{Labels: labelpb.ZLabelsFromPromLabels(extLabels)},
 			},
 			StoreType: component.ToProto(),
 			MinTime:   math.MaxInt64,
@@ -151,25 +151,20 @@ func (s *LocalStore) Info(_ context.Context, _ *storepb.InfoRequest) (*storepb.I
 // Series returns all series for a requested time range and label matcher. The returned data may
 // exceed the requested time bounds.
 func (s *LocalStore) Series(r *storepb.SeriesRequest, srv storepb.Store_SeriesServer) error {
-	match, newMatchers, err := matchesExternalLabels(r.Matchers, s.extLabels)
+	match, matchers, err := matchesExternalLabels(r.Matchers, s.extLabels)
 	if err != nil {
 		return status.Error(codes.InvalidArgument, err.Error())
 	}
 	if !match {
 		return nil
 	}
-	if len(newMatchers) == 0 {
+	if len(matchers) == 0 {
 		return status.Error(codes.InvalidArgument, errors.New("no matchers specified (excluding external labels)").Error())
-	}
-
-	matchers, err := storepb.TranslateFromPromMatchers(newMatchers...)
-	if err != nil {
-		return status.Error(codes.InvalidArgument, err.Error())
 	}
 
 	var chosen []int
 	for si, series := range s.series {
-		lbls := labelpb.LabelsToPromLabels(series.Labels)
+		lbls := labelpb.ZLabelsToPromLabels(series.Labels)
 		var noMatch bool
 		for _, m := range matchers {
 			extValue := lbls.Get(m.Name)
@@ -237,7 +232,7 @@ func (s *LocalStore) LabelValues(_ context.Context, r *storepb.LabelValuesReques
 ) {
 	vals := map[string]struct{}{}
 	for _, series := range s.series {
-		lbls := labelpb.LabelsToPromLabels(series.Labels)
+		lbls := labelpb.ZLabelsToPromLabels(series.Labels)
 		val := lbls.Get(r.Label)
 		if val == "" {
 			continue

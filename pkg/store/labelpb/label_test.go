@@ -5,6 +5,10 @@ package labelpb
 
 import (
 	"fmt"
+	ioutil "io/ioutil"
+	"reflect"
+	"sort"
+	"strings"
 	"testing"
 
 	"github.com/prometheus/prometheus/pkg/labels"
@@ -21,10 +25,10 @@ var testLsetMap = map[string]string{
 }
 
 func TestLabelsToPromLabels_LabelsToPromLabels(t *testing.T) {
-	testutil.Equals(t, labels.FromMap(testLsetMap), LabelsToPromLabels(LabelsFromPromLabels(labels.FromMap(testLsetMap))))
+	testutil.Equals(t, labels.FromMap(testLsetMap), ZLabelsToPromLabels(ZLabelsFromPromLabels(labels.FromMap(testLsetMap))))
 
 	lset := labels.FromMap(testLsetMap)
-	for i := range LabelsFromPromLabels(lset) {
+	for i := range ZLabelsFromPromLabels(lset) {
 		if lset[i].Name != "a" {
 			continue
 		}
@@ -38,56 +42,105 @@ func TestLabelsToPromLabels_LabelsToPromLabels(t *testing.T) {
 	testutil.Equals(t, testLsetMap, m)
 }
 
-func TestLabelMarshall_Unmarshall(t *testing.T) {
-	l := LabelsFromPromLabels(labels.FromStrings("aaaaaaa", "bbbbb"))[0]
+func TestLabelMarshal_Unmarshal(t *testing.T) {
+	l := ZLabelsFromPromLabels(labels.FromStrings("aaaaaaa", "bbbbb"))[0]
 	b, err := (&l).Marshal()
 	testutil.Ok(t, err)
 
-	l2 := &Label{}
+	l2 := &ZLabel{}
 	testutil.Ok(t, l2.Unmarshal(b))
-	testutil.Equals(t, labels.FromStrings("aaaaaaa", "bbbbb"), LabelsToPromLabels([]Label{*l2}))
+	testutil.Equals(t, labels.FromStrings("aaaaaaa", "bbbbb"), ZLabelsToPromLabels([]ZLabel{*l2}))
 }
 
 func TestExtendLabels(t *testing.T) {
 	testutil.Equals(t, labels.Labels{{Name: "a", Value: "1"}, {Name: "replica", Value: "01"}, {Name: "xb", Value: "2"}},
-		ExtendLabels(labels.Labels{{Name: "xb", Value: "2"}, {Name: "a", Value: "1"}}, labels.FromStrings("replica", "01")))
+		ExtendSortedLabels(labels.Labels{{Name: "a", Value: "1"}, {Name: "xb", Value: "2"}}, labels.FromStrings("replica", "01")))
 
 	testutil.Equals(t, labels.Labels{{Name: "replica", Value: "01"}},
-		ExtendLabels(labels.Labels{}, labels.FromStrings("replica", "01")))
+		ExtendSortedLabels(labels.Labels{}, labels.FromStrings("replica", "01")))
 
 	testutil.Equals(t, labels.Labels{{Name: "a", Value: "1"}, {Name: "replica", Value: "01"}, {Name: "xb", Value: "2"}},
-		ExtendLabels(labels.Labels{{Name: "xb", Value: "2"}, {Name: "replica", Value: "NOT01"}, {Name: "a", Value: "1"}}, labels.FromStrings("replica", "01")))
+		ExtendSortedLabels(labels.Labels{{Name: "a", Value: "1"}, {Name: "replica", Value: "NOT01"}, {Name: "xb", Value: "2"}}, labels.FromStrings("replica", "01")))
+
+	testInjectExtLabels(testutil.NewTB(t))
+}
+
+func BenchmarkExtendLabels(b *testing.B) {
+	testInjectExtLabels(testutil.NewTB(b))
+}
+
+var x labels.Labels
+
+func testInjectExtLabels(tb testutil.TB) {
+	in := labels.FromStrings(
+		"__name__", "subscription_labels",
+		"_id", "0dfsdfsdsfdsffd1e96-4432-9abe-e33436ea969a",
+		"account", "1afsdfsddsfsdfsdfsdfsdfs",
+		"ebs_account", "1asdasdad45",
+		"email_domain", "asdasddgfkw.example.com",
+		"endpoint", "metrics",
+		"external_organization", "dfsdfsdf",
+		"instance", "10.128.4.231:8080",
+		"job", "sdd-acct-mngr-metrics",
+		"managed", "false",
+		"namespace", "production",
+		"organization", "dasdadasdasasdasaaFGDSG",
+		"pod", "sdd-acct-mngr-6669c947c8-xjx7f",
+		"prometheus", "telemeter-production/telemeter",
+		"prometheus_replica", "prometheus-telemeter-1",
+		"risk", "5",
+		"service", "sdd-acct-mngr-metrics",
+		"support", "Self-Support", // Should be overwritten.
+	)
+	extLset := labels.FromStrings(
+		"support", "Host-Support",
+		"replica", "1",
+		"tenant", "2342",
+	)
+	tb.ResetTimer()
+	for i := 0; i < tb.N(); i++ {
+		x = ExtendSortedLabels(in, extLset)
+
+		if !tb.IsBenchmark() {
+			testutil.Equals(tb, labels.FromStrings(
+				"__name__", "subscription_labels",
+				"_id", "0dfsdfsdsfdsffd1e96-4432-9abe-e33436ea969a",
+				"account", "1afsdfsddsfsdfsdfsdfsdfs",
+				"ebs_account", "1asdasdad45",
+				"email_domain", "asdasddgfkw.example.com",
+				"endpoint", "metrics",
+				"external_organization", "dfsdfsdf",
+				"instance", "10.128.4.231:8080",
+				"job", "sdd-acct-mngr-metrics",
+				"managed", "false",
+				"namespace", "production",
+				"organization", "dasdadasdasasdasaaFGDSG",
+				"pod", "sdd-acct-mngr-6669c947c8-xjx7f",
+				"prometheus", "telemeter-production/telemeter",
+				"prometheus_replica", "prometheus-telemeter-1",
+				"replica", "1",
+				"risk", "5",
+				"service", "sdd-acct-mngr-metrics",
+				"support", "Host-Support",
+				"tenant", "2342",
+			), x)
+		}
+	}
+	fmt.Fprint(ioutil.Discard, x)
 }
 
 var (
-	dest     Label
-	destCopy FullCopyLabel
+	zdest ZLabel
+	dest  Label
 )
 
-func BenchmarkLabelsMarshallUnmarshall(b *testing.B) {
+func BenchmarkZLabelsMarshalUnmarshal(b *testing.B) {
 	const (
 		fmtLbl = "%07daaaaaaaaaabbbbbbbbbbccccccccccdddddddddd"
 		num    = 1000000
 	)
 
-	b.Run("copy", func(b *testing.B) {
-		b.ReportAllocs()
-		lbls := FullCopyLabelSet{Labels: make([]FullCopyLabel, 0, num)}
-		for i := 0; i < num; i++ {
-			lbls.Labels = append(lbls.Labels, FullCopyLabel{Name: fmt.Sprintf(fmtLbl, i), Value: fmt.Sprintf(fmtLbl, i)})
-		}
-		b.ResetTimer()
-
-		for i := 0; i < b.N; i++ {
-			data, err := lbls.Marshal()
-			testutil.Ok(b, err)
-
-			destCopy = FullCopyLabel{}
-			testutil.Ok(b, (&destCopy).Unmarshal(data))
-		}
-	})
-
-	b.Run("zerocopy", func(b *testing.B) {
+	b.Run("Label", func(b *testing.B) {
 		b.ReportAllocs()
 		lbls := LabelSet{Labels: make([]Label, 0, num)}
 		for i := 0; i < num; i++ {
@@ -103,4 +156,268 @@ func BenchmarkLabelsMarshallUnmarshall(b *testing.B) {
 			testutil.Ok(b, (&dest).Unmarshal(data))
 		}
 	})
+
+	b.Run("ZLabel", func(b *testing.B) {
+		b.ReportAllocs()
+		lbls := ZLabelSet{Labels: make([]ZLabel, 0, num)}
+		for i := 0; i < num; i++ {
+			lbls.Labels = append(lbls.Labels, ZLabel{Name: fmt.Sprintf(fmtLbl, i), Value: fmt.Sprintf(fmtLbl, i)})
+		}
+		b.ResetTimer()
+
+		for i := 0; i < b.N; i++ {
+			data, err := lbls.Marshal()
+			testutil.Ok(b, err)
+
+			zdest = ZLabel{}
+			testutil.Ok(b, (&zdest).Unmarshal(data))
+		}
+	})
+}
+
+var ret labels.Labels
+
+func BenchmarkTransformWithAndWithoutCopy(b *testing.B) {
+	const (
+		fmtLbl = "%07daaaaaaaaaabbbbbbbbbbccccccccccdddddddddd"
+		num    = 1000000
+	)
+
+	b.Run("ZLabelsToPromLabels", func(b *testing.B) {
+		b.ReportAllocs()
+		lbls := make([]ZLabel, num)
+		for i := 0; i < num; i++ {
+			lbls[i] = ZLabel{Name: fmt.Sprintf(fmtLbl, i), Value: fmt.Sprintf(fmtLbl, i)}
+		}
+		b.ResetTimer()
+
+		for i := 0; i < b.N; i++ {
+			ret = ZLabelsToPromLabels(lbls)
+		}
+	})
+	b.Run("ZLabelsToPromLabelsWithRealloc", func(b *testing.B) {
+		b.ReportAllocs()
+		lbls := make([]ZLabel, num)
+		for i := 0; i < num; i++ {
+			lbls[i] = ZLabel{Name: fmt.Sprintf(fmtLbl, i), Value: fmt.Sprintf(fmtLbl, i)}
+		}
+		b.ResetTimer()
+
+		for i := 0; i < b.N; i++ {
+			ReAllocZLabelsStrings(&lbls)
+			ret = ZLabelsToPromLabels(lbls)
+		}
+	})
+}
+
+func TestSortZLabelSets(t *testing.T) {
+	expectedResult := ZLabelSets{
+		{
+			Labels: ZLabelsFromPromLabels(
+				labels.FromMap(map[string]string{
+					"__name__":    "grpc_client_handled_total",
+					"cluster":     "test",
+					"grpc_code":   "OK",
+					"grpc_method": "Info",
+				}),
+			),
+		},
+		{
+			Labels: ZLabelsFromPromLabels(
+				labels.FromMap(map[string]string{
+					"__name__":    "grpc_client_handled_total",
+					"cluster":     "test",
+					"grpc_code":   "OK",
+					"grpc_method": "LabelNames",
+				}),
+			),
+		},
+		{
+			Labels: ZLabelsFromPromLabels(
+				labels.FromMap(map[string]string{
+					"__name__":  "grpc_client_handled_total",
+					"cluster":   "test",
+					"grpc_code": "OK",
+					"aa":        "1",
+					"bb":        "2",
+					"cc":        "3",
+					"dd":        "4",
+					"ee":        "5",
+				}),
+			),
+		},
+		{
+			Labels: ZLabelsFromPromLabels(
+				labels.FromMap(map[string]string{
+					"__name__":  "grpc_client_handled_total",
+					"cluster":   "test",
+					"grpc_code": "OK",
+					"aa":        "1",
+					"bb":        "2",
+					"cc":        "3",
+					"dd":        "4",
+					"ee":        "5",
+				}),
+			),
+		},
+		{
+			Labels: ZLabelsFromPromLabels(
+				labels.FromMap(map[string]string{
+					"__name__":    "grpc_server_handled_total",
+					"cluster":     "test",
+					"grpc_code":   "OK",
+					"grpc_method": "Info",
+				}),
+			),
+		},
+		{
+			Labels: ZLabelsFromPromLabels(
+				labels.FromMap(map[string]string{
+					"__name__": "up",
+					"instance": "localhost:10908",
+				}),
+			),
+		},
+	}
+
+	list := ZLabelSets{
+		{
+			Labels: ZLabelsFromPromLabels(
+				labels.FromMap(map[string]string{
+					"__name__": "up",
+					"instance": "localhost:10908",
+				}),
+			),
+		},
+		{
+			Labels: ZLabelsFromPromLabels(
+				labels.FromMap(map[string]string{
+					"__name__":    "grpc_server_handled_total",
+					"cluster":     "test",
+					"grpc_code":   "OK",
+					"grpc_method": "Info",
+				}),
+			),
+		},
+		{
+			Labels: ZLabelsFromPromLabels(
+				labels.FromMap(map[string]string{
+					"__name__":    "grpc_client_handled_total",
+					"cluster":     "test",
+					"grpc_code":   "OK",
+					"grpc_method": "LabelNames",
+				}),
+			),
+		},
+		{
+			Labels: ZLabelsFromPromLabels(
+				labels.FromMap(map[string]string{
+					"__name__":    "grpc_client_handled_total",
+					"cluster":     "test",
+					"grpc_code":   "OK",
+					"grpc_method": "Info",
+				}),
+			),
+		},
+		{
+			Labels: ZLabelsFromPromLabels(
+				labels.FromMap(map[string]string{
+					"__name__":  "grpc_client_handled_total",
+					"cluster":   "test",
+					"grpc_code": "OK",
+					"aa":        "1",
+					"bb":        "2",
+					"cc":        "3",
+					"dd":        "4",
+					"ee":        "5",
+				}),
+			),
+		},
+		// This label set is the same as the previous one, which should correctly return 0 in Less() function.
+		{
+			Labels: ZLabelsFromPromLabels(
+				labels.FromMap(map[string]string{
+					"cluster":   "test",
+					"__name__":  "grpc_client_handled_total",
+					"grpc_code": "OK",
+					"aa":        "1",
+					"bb":        "2",
+					"cc":        "3",
+					"dd":        "4",
+					"ee":        "5",
+				}),
+			),
+		},
+	}
+
+	sort.Sort(list)
+	reflect.DeepEqual(expectedResult, list)
+}
+
+func TestHashWithPrefix(t *testing.T) {
+	lbls := []ZLabel{
+		{Name: "foo", Value: "bar"},
+		{Name: "baz", Value: "qux"},
+	}
+	testutil.Equals(t, HashWithPrefix("a", lbls), HashWithPrefix("a", lbls))
+	testutil.Assert(t, HashWithPrefix("a", lbls) != HashWithPrefix("a", []ZLabel{lbls[0]}))
+	testutil.Assert(t, HashWithPrefix("a", lbls) != HashWithPrefix("a", []ZLabel{lbls[1], lbls[0]}))
+	testutil.Assert(t, HashWithPrefix("a", lbls) != HashWithPrefix("b", lbls))
+}
+
+var benchmarkLabelsResult uint64
+
+func BenchmarkHasWithPrefix(b *testing.B) {
+	for _, tcase := range []struct {
+		name string
+		lbls []ZLabel
+	}{
+		{
+			name: "typical labels under 1KB",
+			lbls: func() []ZLabel {
+				lbls := make([]ZLabel, 10)
+				for i := 0; i < len(lbls); i++ {
+					// ZLabel ~20B name, 50B value.
+					lbls[i] = ZLabel{Name: fmt.Sprintf("abcdefghijabcdefghijabcdefghij%d", i), Value: fmt.Sprintf("abcdefghijabcdefghijabcdefghijabcdefghijabcdefghij%d", i)}
+				}
+				return lbls
+			}(),
+		},
+		{
+			name: "bigger labels over 1KB",
+			lbls: func() []ZLabel {
+				lbls := make([]ZLabel, 10)
+				for i := 0; i < len(lbls); i++ {
+					//ZLabel ~50B name, 50B value.
+					lbls[i] = ZLabel{Name: fmt.Sprintf("abcdefghijabcdefghijabcdefghijabcdefghijabcdefghij%d", i), Value: fmt.Sprintf("abcdefghijabcdefghijabcdefghijabcdefghijabcdefghij%d", i)}
+				}
+				return lbls
+			}(),
+		},
+		{
+			name: "extremely large label value 10MB",
+			lbls: func() []ZLabel {
+				lbl := &strings.Builder{}
+				lbl.Grow(1024 * 1024 * 10) // 10MB.
+				word := "abcdefghij"
+				for i := 0; i < lbl.Cap()/len(word); i++ {
+					_, _ = lbl.WriteString(word)
+				}
+				return []ZLabel{{Name: "__name__", Value: lbl.String()}}
+			}(),
+		},
+	} {
+		b.Run(tcase.name, func(b *testing.B) {
+			var h uint64
+
+			const prefix = "test-"
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				h = HashWithPrefix(prefix, tcase.lbls)
+			}
+			benchmarkLabelsResult = h
+		})
+	}
 }

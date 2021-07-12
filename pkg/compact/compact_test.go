@@ -6,10 +6,11 @@ package compact
 import (
 	"testing"
 
-	"github.com/thanos-io/thanos/pkg/block/metadata"
-
 	"github.com/pkg/errors"
-	terrors "github.com/prometheus/prometheus/tsdb/errors"
+	"github.com/prometheus/prometheus/tsdb"
+
+	"github.com/thanos-io/thanos/pkg/block/metadata"
+	"github.com/thanos-io/thanos/pkg/errutil"
 	"github.com/thanos-io/thanos/pkg/testutil"
 )
 
@@ -31,12 +32,12 @@ func TestHaltMultiError(t *testing.T) {
 	haltErr := halt(errors.New("halt error"))
 	nonHaltErr := errors.New("not a halt error")
 
-	errs := terrors.MultiError{nonHaltErr}
-	testutil.Assert(t, !IsHaltError(errs), "should not be a halt error")
+	errs := errutil.MultiError{nonHaltErr}
+	testutil.Assert(t, !IsHaltError(errs.Err()), "should not be a halt error")
 
 	errs.Add(haltErr)
-	testutil.Assert(t, IsHaltError(errs), "if any halt errors are present this should return true")
-	testutil.Assert(t, IsHaltError(errors.Wrap(errs, "wrap")), "halt error with wrap")
+	testutil.Assert(t, IsHaltError(errs.Err()), "if any halt errors are present this should return true")
+	testutil.Assert(t, IsHaltError(errors.Wrap(errs.Err(), "wrap")), "halt error with wrap")
 
 }
 
@@ -44,16 +45,16 @@ func TestRetryMultiError(t *testing.T) {
 	retryErr := retry(errors.New("retry error"))
 	nonRetryErr := errors.New("not a retry error")
 
-	errs := terrors.MultiError{nonRetryErr}
-	testutil.Assert(t, !IsRetryError(errs), "should not be a retry error")
+	errs := errutil.MultiError{nonRetryErr}
+	testutil.Assert(t, !IsRetryError(errs.Err()), "should not be a retry error")
 
-	errs = terrors.MultiError{retryErr}
-	testutil.Assert(t, IsRetryError(errs), "if all errors are retriable this should return true")
+	errs = errutil.MultiError{retryErr}
+	testutil.Assert(t, IsRetryError(errs.Err()), "if all errors are retriable this should return true")
 
-	testutil.Assert(t, IsRetryError(errors.Wrap(errs, "wrap")), "retry error with wrap")
+	testutil.Assert(t, IsRetryError(errors.Wrap(errs.Err(), "wrap")), "retry error with wrap")
 
-	errs = terrors.MultiError{nonRetryErr, retryErr}
-	testutil.Assert(t, !IsRetryError(errs), "mixed errors should return false")
+	errs = errutil.MultiError{nonRetryErr, retryErr}
+	testutil.Assert(t, !IsRetryError(errs.Err()), "mixed errors should return false")
 }
 
 func TestRetryError(t *testing.T) {
@@ -110,4 +111,17 @@ func TestGroupKey(t *testing.T) {
 			return
 		}
 	}
+}
+
+func TestGroupMaxMinTime(t *testing.T) {
+	g := &Group{
+		metasByMinTime: []*metadata.Meta{
+			{BlockMeta: tsdb.BlockMeta{MinTime: 0, MaxTime: 10}},
+			{BlockMeta: tsdb.BlockMeta{MinTime: 1, MaxTime: 20}},
+			{BlockMeta: tsdb.BlockMeta{MinTime: 2, MaxTime: 30}},
+		},
+	}
+
+	testutil.Equals(t, int64(0), g.MinTime())
+	testutil.Equals(t, int64(30), g.MaxTime())
 }

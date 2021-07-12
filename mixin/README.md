@@ -35,7 +35,7 @@ To install:
 go get github.com/jsonnet-bundler/jsonnet-bundler/cmd/jb
 ```
 
-> An e.g. of how to install a given version of this library: `jb install github.com/thanos-io/thanos/mixin@master`.
+> An e.g. of how to install a given version of this library: `jb install github.com/thanos-io/thanos/mixin@main`.
 
 ## Use as a library
 
@@ -44,7 +44,7 @@ To use the `thanos-mixin` as a dependency, simply use the `jsonnet-bundler` inst
 $ mkdir thanos-mixin; cd thanos-mixin
 $ jb init  # Creates the initial/empty `jsonnetfile.json`
 # Install the thanos-mixin dependency
-$ jb install github.com/thanos-io/thanos/mixin@master # Creates `vendor/` & `jsonnetfile.lock.json`, and fills in `jsonnetfile.json`
+$ jb install github.com/thanos-io/thanos/mixin@main # Creates `vendor/` & `jsonnetfile.lock.json`, and fills in `jsonnetfile.json`
 ```
 
 To update the `thanos-mixin` as a dependency, simply use the `jsonnet-bundler` update functionality:
@@ -54,53 +54,77 @@ $ jb update
 
 #### Configure
 
-This project is intended to be used as a library. You can extend and customize dashboards and alerting rules by creating for own generators, such as the generators ([alerts.jsonnet](alerts.jsonnet) and [dashboards.jsonnet](dashboards.jsonnet)) that are use to create [examples](/examples). Default parameters are collected in [config.libsonnet](config.libsonnet), feel free to modify and generate your own definitons.
+This project is intended to be used as a library. You can extend and customize dashboards and alerting rules by creating for own generators, such as the generators ([alerts.jsonnet](alerts.jsonnet) and [dashboards.jsonnet](dashboards.jsonnet)) that are use to create [examples](/examples). Default parameters are collected in [config.libsonnet](config.libsonnet), feel free to modify and generate your own definitions.
 
 [embedmd]:# (config.libsonnet)
 ```libsonnet
 {
+  local thanos = self,
+  // TargetGroups is a way to help mixin users to add high level target grouping to their alerts and dashboards.
+  // With the help of TargetGroups you can use a single observability stack to monitor several Thanos instances.
+  // The key in the key-value pair will be used as "label name" in the alerts and variable name in the dashboards.
+  // The value in the key-value pair will be used as a query to fetch available values for the given label name.
+  targetGroups+:: {
+    // For example for given following groups,
+    // namespace: 'thanos_status',
+    // cluster: 'find_mi_cluster_bitte',
+    // zone: 'an_i_in_da_zone',
+    // region: 'losing_my_region',
+    // will generate queriers for the alerts as follows:
+    //  (
+    //     sum by (cluster, namespace, region, zone, job) (rate(thanos_compact_group_compactions_failures_total{job=~"thanos-compact.*"}[5m]))
+    //   /
+    //     sum by (cluster, namespace, region, zone, job) (rate(thanos_compact_group_compactions_total{job=~"thanos-compact.*"}[5m]))
+    //   * 100 > 5
+    //   )
+    //
+    // AND for the dashborads:
+    //
+    // sum by (cluster, namespace, region, zone, job) (rate(thanos_compact_group_compactions_failures_total{cluster=\"$cluster\", namespace=\"$namespace\", region=\"$region\", zone=\"$zone\", job=\"$job\"}[$interval]))
+    // /
+    // sum by (cluster, namespace, region, zone, job) (rate(thanos_compact_group_compactions_total{cluster=\"$cluster\", namespace=\"$namespace\", region=\"$region\", zone=\"$zone\", job=\"$job\"}[$interval]))
+  },
   query+:: {
-    jobPrefix: 'thanos-query',
-    selector: 'job=~"%s.*"' % self.jobPrefix,
+    selector: 'job=~".*thanos-query.*"',
     title: '%(prefix)sQuery' % $.dashboard.prefix,
   },
   store+:: {
-    jobPrefix: 'thanos-store',
-    selector: 'job=~"%s.*"' % self.jobPrefix,
+    selector: 'job=~".*thanos-store.*"',
     title: '%(prefix)sStore' % $.dashboard.prefix,
   },
   receive+:: {
-    jobPrefix: 'thanos-receive',
-    selector: 'job=~"%s.*"' % self.jobPrefix,
+    selector: 'job=~".*thanos-receive.*"',
     title: '%(prefix)sReceive' % $.dashboard.prefix,
   },
   rule+:: {
-    jobPrefix: 'thanos-rule',
-    selector: 'job=~"%s.*"' % self.jobPrefix,
+    selector: 'job=~".*thanos-rule.*"',
     title: '%(prefix)sRule' % $.dashboard.prefix,
   },
   compact+:: {
-    jobPrefix: 'thanos-compact',
-    selector: 'job=~"%s.*"' % self.jobPrefix,
+    selector: 'job=~".*thanos-compact.*"',
     title: '%(prefix)sCompact' % $.dashboard.prefix,
   },
   sidecar+:: {
-    jobPrefix: 'thanos-sidecar',
-    selector: 'job=~"%s.*"' % self.jobPrefix,
+    selector: 'job=~".*thanos-sidecar.*"',
     title: '%(prefix)sSidecar' % $.dashboard.prefix,
   },
+  // TODO(kakkoyun): Fix naming convention: bucketReplicate
   bucket_replicate+:: {
-    jobPrefix: 'thanos-bucket-replicate',
-    selector: 'job=~"%s.*"' % self.jobPrefix,
+    selector: 'job=~".*thanos-bucket-replicate.*"',
     title: '%(prefix)sBucketReplicate' % $.dashboard.prefix,
-  },
-  overview+:: {
-    title: '%(prefix)sOverview' % $.dashboard.prefix,
   },
   dashboard+:: {
     prefix: 'Thanos / ',
     tags: ['thanos-mixin'],
-    namespaceQuery: 'kube_pod_info',
+    timezone: 'UTC',
+    selector: ['%s="$%s"' % [level, level] for level in std.objectFields(thanos.targetGroups)],
+    dimensions: ['%s' % level for level in std.objectFields(thanos.targetGroups)],
+
+    overview+:: {
+      title: '%(prefix)sOverview' % $.dashboard.prefix,
+      selector: std.join(', ', thanos.dashboard.selector),
+      dimensions: std.join(', ', thanos.dashboard.dimensions + ['job']),
+    },
   },
 }
 ```
@@ -120,7 +144,7 @@ Although all the required dependencies are handled by `Makefile`, keep in mind t
 
 #### gojsontoyaml
 
-`gojsontoyaml` is used to convert generated `json` definitons to `yaml`.
+`gojsontoyaml` is used to convert generated `json` definitions to `yaml`.
 
 To install:
 ```shell
@@ -142,7 +166,7 @@ $ make examples
 
 Make action runs the jsonnet code, then reads each key of the generated json and uses that as the file name, and writes the value of that key to that file, and converts each json manifest to yaml.
 
-> Make commands should handle dependecies for you.
+> Make commands should handle dependencies for you.
 
 ### Test and validate
 

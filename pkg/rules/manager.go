@@ -21,13 +21,14 @@ import (
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/pkg/rulefmt"
 	"github.com/prometheus/prometheus/rules"
-	tsdberrors "github.com/prometheus/prometheus/tsdb/errors"
 	"gopkg.in/yaml.v3"
 
+	"github.com/thanos-io/thanos/pkg/errutil"
 	"github.com/thanos-io/thanos/pkg/extprom"
 	"github.com/thanos-io/thanos/pkg/rules/rulespb"
 	"github.com/thanos-io/thanos/pkg/store/labelpb"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
+	"github.com/thanos-io/thanos/pkg/tracing"
 )
 
 const tmpRuleDir = ".tmp-rules"
@@ -63,8 +64,8 @@ func (g Group) toProto() *rulespb.RuleGroup {
 					Name:                      rule.Name(),
 					Query:                     rule.Query().String(),
 					DurationSeconds:           rule.HoldDuration().Seconds(),
-					Labels:                    storepb.LabelSet{Labels: labelpb.LabelsFromPromLabels(rule.Labels())},
-					Annotations:               storepb.LabelSet{Labels: labelpb.LabelsFromPromLabels(rule.Annotations())},
+					Labels:                    labelpb.ZLabelSet{Labels: labelpb.ZLabelsFromPromLabels(rule.Labels())},
+					Annotations:               labelpb.ZLabelSet{Labels: labelpb.ZLabelsFromPromLabels(rule.Annotations())},
 					Alerts:                    ActiveAlertsToProto(g.PartialResponseStrategy, rule),
 					Health:                    string(rule.Health()),
 					LastError:                 lastError,
@@ -77,7 +78,7 @@ func (g Group) toProto() *rulespb.RuleGroup {
 				Result: &rulespb.Rule_Recording{Recording: &rulespb.RecordingRule{
 					Name:                      rule.Name(),
 					Query:                     rule.Query().String(),
-					Labels:                    storepb.LabelSet{Labels: labelpb.LabelsFromPromLabels(rule.Labels())},
+					Labels:                    labelpb.ZLabelSet{Labels: labelpb.ZLabelsFromPromLabels(rule.Labels())},
 					Health:                    string(rule.Health()),
 					LastError:                 lastError,
 					EvaluationDurationSeconds: rule.GetEvaluationDuration().Seconds(),
@@ -98,8 +99,8 @@ func ActiveAlertsToProto(s storepb.PartialResponseStrategy, a *rules.AlertingRul
 	for i, ruleAlert := range active {
 		ret[i] = &rulespb.AlertInstance{
 			PartialResponseStrategy: s,
-			Labels:                  storepb.LabelSet{Labels: labelpb.LabelsFromPromLabels(ruleAlert.Labels)},
-			Annotations:             storepb.LabelSet{Labels: labelpb.LabelsFromPromLabels(ruleAlert.Annotations)},
+			Labels:                  labelpb.ZLabelSet{Labels: labelpb.ZLabelsFromPromLabels(ruleAlert.Labels)},
+			Annotations:             labelpb.ZLabelSet{Labels: labelpb.ZLabelsFromPromLabels(ruleAlert.Annotations)},
 			State:                   rulespb.AlertState(ruleAlert.State),
 			ActiveAt:                &ruleAlert.ActiveAt, //nolint:exportloopref
 			Value:                   strconv.FormatFloat(ruleAlert.Value, 'e', -1, 64),
@@ -277,7 +278,7 @@ func (g configRuleAdapter) validate() (errs []error) {
 
 // ValidateAndCount validates all rules in the rule groups and return overal number of rules in all groups.
 // TODO(bwplotka): Replace this with upstream implementation after https://github.com/prometheus/prometheus/issues/7128 is fixed.
-func ValidateAndCount(group io.Reader) (numRules int, errs tsdberrors.MultiError) {
+func ValidateAndCount(group io.Reader) (numRules int, errs errutil.MultiError) {
 	var rgs configGroups
 	d := yaml.NewDecoder(group)
 	d.KnownFields(true)
@@ -309,7 +310,7 @@ type configGroups struct {
 // special field in configGroups.configRuleAdapter struct.
 func (m *Manager) Update(evalInterval time.Duration, files []string) error {
 	var (
-		errs            tsdberrors.MultiError
+		errs            errutil.MultiError
 		filesByStrategy = map[storepb.PartialResponseStrategy][]string{}
 		ruleFiles       = map[string]string{}
 	)
@@ -328,7 +329,7 @@ func (m *Manager) Update(evalInterval time.Duration, files []string) error {
 	}
 
 	for _, fn := range files {
-		b, err := ioutil.ReadFile(fn)
+		b, err := ioutil.ReadFile(filepath.Clean(fn))
 		if err != nil {
 			errs.Add(err)
 			continue
@@ -390,7 +391,7 @@ func (m *Manager) Update(evalInterval time.Duration, files []string) error {
 }
 
 // Rules returns specified rules from manager. This is used by gRPC and locally for HTTP and UI purposes.
-func (m *Manager) Rules(r *rulespb.RulesRequest, s rulespb.Rules_RulesServer) error {
+func (m *Manager) Rules(r *rulespb.RulesRequest, s rulespb.Rules_RulesServer) (err error) {
 	groups := m.protoRuleGroups()
 
 	pgs := make([]*rulespb.RuleGroup, 0, len(groups))
@@ -419,7 +420,10 @@ func (m *Manager) Rules(r *rulespb.RulesRequest, s rulespb.Rules_RulesServer) er
 	enrichRulesWithExtLabels(pgs, m.extLset)
 
 	for _, pg := range pgs {
-		if err := s.Send(&rulespb.RulesResponse{Result: &rulespb.RulesResponse_Group{Group: pg}}); err != nil {
+		tracing.DoInSpan(s.Context(), "send_rule_group_response", func(_ context.Context) {
+			err = s.Send(&rulespb.RulesResponse{Result: &rulespb.RulesResponse_Group{Group: pg}})
+		})
+		if err != nil {
 			return err
 		}
 	}

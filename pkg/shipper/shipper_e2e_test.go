@@ -45,7 +45,7 @@ func TestShipper_SyncBlocks_e2e(t *testing.T) {
 		}()
 
 		extLset := labels.FromStrings("prometheus", "prom-1")
-		shipper := New(log.NewLogfmtLogger(os.Stderr), nil, dir, metricsBucket, func() labels.Labels { return extLset }, metadata.TestSource, false, false)
+		shipper := New(log.NewLogfmtLogger(os.Stderr), nil, dir, metricsBucket, func() labels.Labels { return extLset }, metadata.TestSource, false, false, metadata.NoneFunc)
 
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
@@ -141,12 +141,16 @@ func TestShipper_SyncBlocks_e2e(t *testing.T) {
 
 			// The external labels must be attached to the meta file on upload.
 			meta.Thanos.Labels = extLset.Map()
+			meta.Thanos.SegmentFiles = []string{"0001", "0002"}
+			meta.Thanos.Files = []metadata.File{
+				{RelPath: "chunks/0001", SizeBytes: 14},
+				{RelPath: "chunks/0002", SizeBytes: 14},
+				{RelPath: "index", SizeBytes: 13},
+				{RelPath: "meta.json"},
+			}
 
-			var buf bytes.Buffer
-			enc := json.NewEncoder(&buf)
-			enc.SetIndent("", "\t")
-
-			testutil.Ok(t, enc.Encode(&meta))
+			buf := bytes.Buffer{}
+			testutil.Ok(t, meta.Write(&buf))
 
 			// We will delete the fifth block and do not expect it to be re-uploaded later.
 			if i != 4 && i != 5 {
@@ -208,18 +212,19 @@ func TestShipper_SyncBlocksWithMigrating_e2e(t *testing.T) {
 
 		testutil.Ok(t, p.Start())
 
+		logger := log.NewNopLogger()
 		upctx, upcancel := context.WithTimeout(ctx, 10*time.Second)
 		defer upcancel()
-		testutil.Ok(t, p.WaitPrometheusUp(upctx))
+		testutil.Ok(t, p.WaitPrometheusUp(upctx, logger))
 
 		p.DisableCompaction()
 		testutil.Ok(t, p.Restart())
 
 		upctx2, upcancel2 := context.WithTimeout(ctx, 10*time.Second)
 		defer upcancel2()
-		testutil.Ok(t, p.WaitPrometheusUp(upctx2))
+		testutil.Ok(t, p.WaitPrometheusUp(upctx2, logger))
 
-		shipper := New(log.NewLogfmtLogger(os.Stderr), nil, dir, bkt, func() labels.Labels { return extLset }, metadata.TestSource, true, false)
+		shipper := New(log.NewLogfmtLogger(os.Stderr), nil, dir, bkt, func() labels.Labels { return extLset }, metadata.TestSource, true, false, metadata.NoneFunc)
 
 		// Create 10 new blocks. 9 of them (non compacted) should be actually uploaded.
 		var (
@@ -293,12 +298,16 @@ func TestShipper_SyncBlocksWithMigrating_e2e(t *testing.T) {
 
 			// The external labels must be attached to the meta file on upload.
 			meta.Thanos.Labels = extLset.Map()
+			meta.Thanos.SegmentFiles = []string{"0001", "0002"}
+			meta.Thanos.Files = []metadata.File{
+				{RelPath: "chunks/0001", SizeBytes: 14},
+				{RelPath: "chunks/0002", SizeBytes: 14},
+				{RelPath: "index", SizeBytes: 13},
+				{RelPath: "meta.json"},
+			}
 
-			var buf bytes.Buffer
-			enc := json.NewEncoder(&buf)
-			enc.SetIndent("", "\t")
-
-			testutil.Ok(t, enc.Encode(&meta))
+			buf := bytes.Buffer{}
+			testutil.Ok(t, meta.Write(&buf))
 
 			// We will delete the fifth block and do not expect it to be re-uploaded later.
 			if i != 4 {

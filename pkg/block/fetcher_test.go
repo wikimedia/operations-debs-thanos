@@ -32,10 +32,10 @@ import (
 	"github.com/thanos-io/thanos/pkg/testutil"
 )
 
-func newTestFetcherMetrics() *fetcherMetrics {
-	return &fetcherMetrics{
-		synced:   extprom.NewTxGaugeVec(nil, prometheus.GaugeOpts{}, []string{"state"}),
-		modified: extprom.NewTxGaugeVec(nil, prometheus.GaugeOpts{}, []string{"modified"}),
+func newTestFetcherMetrics() *FetcherMetrics {
+	return &FetcherMetrics{
+		Synced:   extprom.NewTxGaugeVec(nil, prometheus.GaugeOpts{}, []string{"state"}),
+		Modified: extprom.NewTxGaugeVec(nil, prometheus.GaugeOpts{}, []string{"modified"}),
 	}
 }
 
@@ -280,14 +280,14 @@ func TestMetaFetcher_Fetch(t *testing.T) {
 					expectedFailures = 1
 				}
 				testutil.Equals(t, float64(i+1), promtest.ToFloat64(baseFetcher.syncs))
-				testutil.Equals(t, float64(i+1), promtest.ToFloat64(fetcher.metrics.syncs))
-				testutil.Equals(t, float64(len(tcase.expectedMetas)), promtest.ToFloat64(fetcher.metrics.synced.WithLabelValues(loadedMeta)))
-				testutil.Equals(t, float64(len(tcase.expectedNoMeta)), promtest.ToFloat64(fetcher.metrics.synced.WithLabelValues(noMeta)))
-				testutil.Equals(t, float64(tcase.expectedFiltered), promtest.ToFloat64(fetcher.metrics.synced.WithLabelValues("filtered")))
-				testutil.Equals(t, 0.0, promtest.ToFloat64(fetcher.metrics.synced.WithLabelValues(labelExcludedMeta)))
-				testutil.Equals(t, 0.0, promtest.ToFloat64(fetcher.metrics.synced.WithLabelValues(timeExcludedMeta)))
-				testutil.Equals(t, float64(expectedFailures), promtest.ToFloat64(fetcher.metrics.synced.WithLabelValues(failedMeta)))
-				testutil.Equals(t, 0.0, promtest.ToFloat64(fetcher.metrics.synced.WithLabelValues(tooFreshMeta)))
+				testutil.Equals(t, float64(i+1), promtest.ToFloat64(fetcher.metrics.Syncs))
+				testutil.Equals(t, float64(len(tcase.expectedMetas)), promtest.ToFloat64(fetcher.metrics.Synced.WithLabelValues(LoadedMeta)))
+				testutil.Equals(t, float64(len(tcase.expectedNoMeta)), promtest.ToFloat64(fetcher.metrics.Synced.WithLabelValues(NoMeta)))
+				testutil.Equals(t, float64(tcase.expectedFiltered), promtest.ToFloat64(fetcher.metrics.Synced.WithLabelValues("filtered")))
+				testutil.Equals(t, 0.0, promtest.ToFloat64(fetcher.metrics.Synced.WithLabelValues(labelExcludedMeta)))
+				testutil.Equals(t, 0.0, promtest.ToFloat64(fetcher.metrics.Synced.WithLabelValues(timeExcludedMeta)))
+				testutil.Equals(t, float64(expectedFailures), promtest.ToFloat64(fetcher.metrics.Synced.WithLabelValues(FailedMeta)))
+				testutil.Equals(t, 0.0, promtest.ToFloat64(fetcher.metrics.Synced.WithLabelValues(tooFreshMeta)))
 			}); !ok {
 				return
 			}
@@ -309,7 +309,7 @@ func TestLabelShardedMetaFilter_Filter_Basic(t *testing.T) {
       source_labels:
       - message
     `
-	relabelConfig, err := ParseRelabelConfig([]byte(relabelContentYaml))
+	relabelConfig, err := ParseRelabelConfig([]byte(relabelContentYaml), SelectorSupportedRelabelActions)
 	testutil.Ok(t, err)
 
 	f := NewLabelShardedMetaFilter(relabelConfig)
@@ -353,9 +353,9 @@ func TestLabelShardedMetaFilter_Filter_Basic(t *testing.T) {
 	}
 
 	m := newTestFetcherMetrics()
-	testutil.Ok(t, f.Filter(ctx, input, m.synced))
+	testutil.Ok(t, f.Filter(ctx, input, m.Synced))
 
-	testutil.Equals(t, 3.0, promtest.ToFloat64(m.synced.WithLabelValues(labelExcludedMeta)))
+	testutil.Equals(t, 3.0, promtest.ToFloat64(m.Synced.WithLabelValues(labelExcludedMeta)))
 	testutil.Equals(t, expected, input)
 
 }
@@ -375,7 +375,7 @@ func TestLabelShardedMetaFilter_Filter_Hashmod(t *testing.T) {
 `
 	for i := 0; i < 3; i++ {
 		t.Run(fmt.Sprintf("%v", i), func(t *testing.T) {
-			relabelConfig, err := ParseRelabelConfig([]byte(fmt.Sprintf(relabelContentYamlFmt, BlockIDLabel, i)))
+			relabelConfig, err := ParseRelabelConfig([]byte(fmt.Sprintf(relabelContentYamlFmt, BlockIDLabel, i)), SelectorSupportedRelabelActions)
 			testutil.Ok(t, err)
 
 			f := NewLabelShardedMetaFilter(relabelConfig)
@@ -451,10 +451,10 @@ func TestLabelShardedMetaFilter_Filter_Hashmod(t *testing.T) {
 			deleted := len(input) - len(expected)
 
 			m := newTestFetcherMetrics()
-			testutil.Ok(t, f.Filter(ctx, input, m.synced))
+			testutil.Ok(t, f.Filter(ctx, input, m.Synced))
 
 			testutil.Equals(t, expected, input)
-			testutil.Equals(t, float64(deleted), promtest.ToFloat64(m.synced.WithLabelValues(labelExcludedMeta)))
+			testutil.Equals(t, float64(deleted), promtest.ToFloat64(m.Synced.WithLabelValues(labelExcludedMeta)))
 
 		})
 
@@ -515,9 +515,9 @@ func TestTimePartitionMetaFilter_Filter(t *testing.T) {
 	}
 
 	m := newTestFetcherMetrics()
-	testutil.Ok(t, f.Filter(ctx, input, m.synced))
+	testutil.Ok(t, f.Filter(ctx, input, m.Synced))
 
-	testutil.Equals(t, 2.0, promtest.ToFloat64(m.synced.WithLabelValues(timeExcludedMeta)))
+	testutil.Equals(t, 2.0, promtest.ToFloat64(m.Synced.WithLabelValues(timeExcludedMeta)))
 	testutil.Equals(t, expected, input)
 
 }
@@ -866,9 +866,9 @@ func TestDeduplicateFilter_Filter(t *testing.T) {
 					},
 				}
 			}
-			testutil.Ok(t, f.Filter(ctx, metas, m.synced))
+			testutil.Ok(t, f.Filter(ctx, metas, m.Synced))
 			compareSliceWithMapKeys(t, metas, tcase.expected)
-			testutil.Equals(t, float64(inputLen-len(tcase.expected)), promtest.ToFloat64(m.synced.WithLabelValues(duplicateMeta)))
+			testutil.Equals(t, float64(inputLen-len(tcase.expected)), promtest.ToFloat64(m.Synced.WithLabelValues(duplicateMeta)))
 		}); !ok {
 			return
 		}
@@ -935,9 +935,9 @@ func TestReplicaLabelRemover_Modify(t *testing.T) {
 		},
 	} {
 		m := newTestFetcherMetrics()
-		testutil.Ok(t, tcase.replicaLabelRemover.Modify(ctx, tcase.input, m.modified))
+		testutil.Ok(t, tcase.replicaLabelRemover.Modify(ctx, tcase.input, m.Modified))
 
-		testutil.Equals(t, tcase.modified, promtest.ToFloat64(m.modified.WithLabelValues(replicaRemovedMeta)))
+		testutil.Equals(t, tcase.modified, promtest.ToFloat64(m.Modified.WithLabelValues(replicaRemovedMeta)))
 		testutil.Equals(t, tcase.expected, tcase.input)
 	}
 }
@@ -1041,8 +1041,8 @@ func TestConsistencyDelayMetaFilter_Filter_0(t *testing.T) {
 		f := NewConsistencyDelayMetaFilter(nil, 0*time.Second, reg)
 		testutil.Equals(t, map[string]float64{"consistency_delay_seconds{}": 0.0}, extprom.CurrentGaugeValuesFor(t, reg, "consistency_delay_seconds"))
 
-		testutil.Ok(t, f.Filter(ctx, input, m.synced))
-		testutil.Equals(t, 0.0, promtest.ToFloat64(m.synced.WithLabelValues(tooFreshMeta)))
+		testutil.Ok(t, f.Filter(ctx, input, m.Synced))
+		testutil.Equals(t, 0.0, promtest.ToFloat64(m.Synced.WithLabelValues(tooFreshMeta)))
 		testutil.Equals(t, expected, input)
 	})
 
@@ -1066,8 +1066,8 @@ func TestConsistencyDelayMetaFilter_Filter_0(t *testing.T) {
 		f := NewConsistencyDelayMetaFilter(nil, 30*time.Minute, reg)
 		testutil.Equals(t, map[string]float64{"consistency_delay_seconds{}": (30 * time.Minute).Seconds()}, extprom.CurrentGaugeValuesFor(t, reg, "consistency_delay_seconds"))
 
-		testutil.Ok(t, f.Filter(ctx, input, m.synced))
-		testutil.Equals(t, float64(len(u.created)-len(expected)), promtest.ToFloat64(m.synced.WithLabelValues(tooFreshMeta)))
+		testutil.Ok(t, f.Filter(ctx, input, m.Synced))
+		testutil.Equals(t, float64(len(u.created)-len(expected)), promtest.ToFloat64(m.Synced.WithLabelValues(tooFreshMeta)))
 		testutil.Equals(t, expected, input)
 	})
 }
@@ -1078,11 +1078,7 @@ func TestIgnoreDeletionMarkFilter_Filter(t *testing.T) {
 		defer cancel()
 
 		now := time.Now()
-		f := &IgnoreDeletionMarkFilter{
-			logger: log.NewNopLogger(),
-			bkt:    objstore.WithNoopInstr(bkt),
-			delay:  48 * time.Hour,
-		}
+		f := NewIgnoreDeletionMarkFilter(log.NewNopLogger(), objstore.WithNoopInstr(bkt), 48*time.Hour, 32)
 
 		shouldFetch := &metadata.DeletionMark{
 			ID:           ULID(1),
@@ -1119,8 +1115,8 @@ func TestIgnoreDeletionMarkFilter_Filter(t *testing.T) {
 		}
 
 		m := newTestFetcherMetrics()
-		testutil.Ok(t, f.Filter(ctx, input, m.synced))
-		testutil.Equals(t, 1.0, promtest.ToFloat64(m.synced.WithLabelValues(markedForDeletionMeta)))
+		testutil.Ok(t, f.Filter(ctx, input, m.Synced))
+		testutil.Equals(t, 1.0, promtest.ToFloat64(m.Synced.WithLabelValues(MarkedForDeletionMeta)))
 		testutil.Equals(t, expected, input)
 	})
 }
@@ -1203,13 +1199,13 @@ func Test_ParseRelabelConfig(t *testing.T) {
       regex: "A"
       source_labels:
       - cluster
-    `))
+    `), SelectorSupportedRelabelActions)
 	testutil.Ok(t, err)
 
 	_, err = ParseRelabelConfig([]byte(`
     - action: labelmap
       regex: "A"
-    `))
+    `), SelectorSupportedRelabelActions)
 	testutil.NotOk(t, err)
 	testutil.Equals(t, "unsupported relabel action: labelmap", err.Error())
 }

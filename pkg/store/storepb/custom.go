@@ -231,13 +231,13 @@ func (s *uniqueSeriesSet) Next() bool {
 		}
 		lset, chks := s.SeriesSet.At()
 		if s.peek == nil {
-			s.peek = &Series{Labels: labelpb.LabelsFromPromLabels(lset), Chunks: chks}
+			s.peek = &Series{Labels: labelpb.ZLabelsFromPromLabels(lset), Chunks: chks}
 			continue
 		}
 
 		if labels.Compare(lset, s.peek.PromLabels()) != 0 {
 			s.lset, s.chunks = s.peek.PromLabels(), s.peek.Chunks
-			s.peek = &Series{Labels: labelpb.LabelsFromPromLabels(lset), Chunks: chks}
+			s.peek = &Series{Labels: labelpb.ZLabelsFromPromLabels(lset), Chunks: chks}
 			return true
 		}
 
@@ -337,9 +337,9 @@ func (x *PartialResponseStrategy) MarshalJSON() ([]byte, error) {
 	return []byte(strconv.Quote(x.String())), nil
 }
 
-// TranslatePromMatchers returns proto matchers from Prometheus matchers.
+// PromMatchersToMatchers returns proto matchers from Prometheus matchers.
 // NOTE: It allocates memory.
-func TranslatePromMatchers(ms ...*labels.Matcher) ([]LabelMatcher, error) {
+func PromMatchersToMatchers(ms ...*labels.Matcher) ([]LabelMatcher, error) {
 	res := make([]LabelMatcher, 0, len(ms))
 	for _, m := range ms {
 		var t LabelMatcher_Type
@@ -361,10 +361,9 @@ func TranslatePromMatchers(ms ...*labels.Matcher) ([]LabelMatcher, error) {
 	return res, nil
 }
 
-// TranslateFromPromMatchers returns Prometheus matchers from proto matchers.
+// MatchersToPromMatchers returns Prometheus matchers from proto matchers.
 // NOTE: It allocates memory.
-// TODO(bwplotka): Create yolo/no-alloc helper.
-func TranslateFromPromMatchers(ms ...LabelMatcher) ([]*labels.Matcher, error) {
+func MatchersToPromMatchers(ms ...LabelMatcher) ([]*labels.Matcher, error) {
 	res := make([]*labels.Matcher, 0, len(ms))
 	for _, m := range ms {
 		var t labels.MatchType
@@ -435,25 +434,25 @@ func (x LabelMatcher_Type) PromString() string {
 
 // PromLabels return Prometheus labels.Labels without extra allocation.
 func (m *Series) PromLabels() labels.Labels {
-	return labelpb.LabelsToPromLabels(m.Labels)
+	return labelpb.ZLabelsToPromLabels(m.Labels)
 }
 
 // Deprecated.
 // TODO(bwplotka): Remove this once Cortex dep will stop using it.
-type Label = labelpb.Label
+type Label = labelpb.ZLabel
 
 // Deprecated.
 // TODO(bwplotka): Remove this in next PR. Done to reduce diff only.
-type LabelSet = labelpb.LabelSet
+type LabelSet = labelpb.ZLabelSet
 
 // Deprecated.
 // TODO(bwplotka): Remove this once Cortex dep will stop using it.
 func CompareLabels(a, b []Label) int {
-	return labels.Compare(labelpb.LabelsToPromLabels(a), labelpb.LabelsToPromLabels(b))
+	return labels.Compare(labelpb.ZLabelsToPromLabels(a), labelpb.ZLabelsToPromLabels(b))
 }
 
 // Deprecated.
 // TODO(bwplotka): Remove this once Cortex dep will stop using it.
 func LabelsToPromLabelsUnsafe(lset []Label) labels.Labels {
-	return labelpb.LabelsToPromLabels(lset)
+	return labelpb.ZLabelsToPromLabels(lset)
 }

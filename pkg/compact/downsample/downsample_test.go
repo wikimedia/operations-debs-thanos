@@ -21,6 +21,7 @@ import (
 	"github.com/prometheus/prometheus/tsdb/chunks"
 	"github.com/prometheus/prometheus/tsdb/index"
 	"github.com/prometheus/prometheus/tsdb/tombstones"
+	"github.com/prometheus/prometheus/tsdb/tsdbutil"
 	"go.uber.org/goleak"
 
 	"github.com/thanos-io/thanos/pkg/block"
@@ -455,7 +456,7 @@ func TestDownsample(t *testing.T) {
 			}
 			testutil.Ok(t, err)
 
-			_, err = metadata.Read(filepath.Join(dir, id.String()))
+			_, err = metadata.ReadFromDir(filepath.Join(dir, id.String()))
 			testutil.Ok(t, err)
 
 			indexr, err := index.NewFileReader(filepath.Join(dir, id.String(), block.IndexFilename))
@@ -757,6 +758,51 @@ func TestCounterSeriesIteratorSeekAfterNext(t *testing.T) {
 	testutil.Equals(t, exp, res)
 }
 
+func TestSamplesFromTSDBSamples(t *testing.T) {
+	for _, tcase := range []struct {
+		name string
+
+		input []tsdbutil.Sample
+
+		expected []sample
+	}{
+		{
+			name:     "empty",
+			input:    []tsdbutil.Sample{},
+			expected: []sample{},
+		},
+		{
+			name:     "one sample",
+			input:    []tsdbutil.Sample{testSample{1, 1}},
+			expected: []sample{{1, 1}},
+		},
+		{
+			name:     "multiple samples",
+			input:    []tsdbutil.Sample{testSample{1, 1}, testSample{2, 2}, testSample{3, 3}, testSample{4, 4}, testSample{5, 5}},
+			expected: []sample{{1, 1}, {2, 2}, {3, 3}, {4, 4}, {5, 5}},
+		},
+	} {
+		t.Run(tcase.name, func(t *testing.T) {
+			actual := SamplesFromTSDBSamples(tcase.input)
+			testutil.Equals(t, tcase.expected, actual)
+		})
+	}
+}
+
+// testSample implements tsdbutil.Sample interface.
+type testSample struct {
+	t int64
+	v float64
+}
+
+func (s testSample) T() int64 {
+	return s.t
+}
+
+func (s testSample) V() float64 {
+	return s.v
+}
+
 type sampleIterator struct {
 	l []sample
 	i int
@@ -913,6 +959,10 @@ func (b *memBlock) Tombstones() (tombstones.Reader, error) {
 
 func (b *memBlock) Close() error {
 	return nil
+}
+
+func (b *memBlock) Size() int64 {
+	return 0
 }
 
 type emptyTombstoneReader struct{}

@@ -67,6 +67,7 @@ mkdir -p ${OUTPUT_CONTENT_DIR}/thanos/
 mv ${OUTPUT_CONTENT_DIR}/*.md ${OUTPUT_CONTENT_DIR}/thanos/
 mv ${OUTPUT_CONTENT_DIR}/thanos/CONTRIBUTING.md ${OUTPUT_CONTENT_DIR}/contributing/CONTRIBUTING.md
 mv ${OUTPUT_CONTENT_DIR}/thanos/CODE_OF_CONDUCT.md ${OUTPUT_CONTENT_DIR}/contributing/CODE_OF_CONDUCT.md
+# This is needed only for v0.13-0.16 versions.
 mv ${OUTPUT_CONTENT_DIR}/thanos/community.md ${OUTPUT_CONTENT_DIR}/contributing/community.md
 
 # Create an _index.md in Thanos dir.
@@ -97,7 +98,7 @@ for file in ${ALL_DOC_CONTENT_FILES}; do
 ---
 
 Found a typo, inconsistency or missing information in our docs?
-Help us to improve [Thanos](https://thanos.io) documentation by proposing a fix [on GitHub here](https://github.com/thanos-io/thanos/edit/master/docs/${relFile}) :heart:
+Help us to improve [Thanos](https://thanos.io) documentation by proposing a fix [on GitHub here](https://github.com/thanos-io/thanos/edit/main/docs/${relFile}) :heart:
 
 EOF
   )" >>${file}
@@ -111,10 +112,3 @@ perl -pi -e 's/]\(\//]\(https:\/\/github.com\/thanos-io\/thanos\/tree\/'${COMMIT
 perl -pi -e 's/]\((?!http)/]\(..\//g' ${ALL_DOC_CONTENT_FILES}
 # All the relative links in src= needs to have ../ as well.
 perl -pi -e 's/src=\"(?!http)/src=\"..\//g' ${ALL_DOC_CONTENT_FILES}
-
-CODING_STYLE_FILE=${OUTPUT_CONTENT_DIR}/contributing/coding-style-guide.md
-# "Mask" bug in blackfriday that does not generate code snippets in tables.
-if [[ -f ${CODING_STYLE_FILE} ]]; then
-  perl -pi -e 's/```([a-z]+)/{{< highlight $1 >}}/g' ${CODING_STYLE_FILE}
-  perl -pi -e 's/```/{{< \/highlight >}}/g' ${CODING_STYLE_FILE}
-fi

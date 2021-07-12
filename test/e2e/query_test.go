@@ -21,7 +21,9 @@ import (
 	"github.com/go-kit/kit/log"
 	"github.com/pkg/errors"
 	"github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/pkg/timestamp"
+	"github.com/thanos-io/thanos/pkg/store/storepb"
 
 	"github.com/thanos-io/thanos/pkg/promclient"
 	"github.com/thanos-io/thanos/pkg/runutil"
@@ -36,7 +38,11 @@ const queryUpWithoutInstance = "sum(up) without (instance)"
 // * expose 2 external labels, source and replica.
 // * scrape fake target. This will produce up == 0 metric which we can assert on.
 // * optionally remote write endpoint to write into.
-func defaultPromConfig(name string, replica int, remoteWriteEndpoint, ruleFile string) string {
+func defaultPromConfig(name string, replica int, remoteWriteEndpoint, ruleFile string, scrapeTargets ...string) string {
+	targets := "localhost:9090"
+	if len(scrapeTargets) > 0 {
+		targets = strings.Join(scrapeTargets, ",")
+	}
 	config := fmt.Sprintf(`
 global:
   external_labels:
@@ -48,8 +54,12 @@ scrape_configs:
   scrape_interval: 1s
   scrape_timeout: 1s
   static_configs:
-  - targets: ['localhost:9090']
-`, name, replica)
+  - targets: [%s]
+  relabel_configs:
+  - source_labels: ['__address__']
+    regex: '^.+:80$'
+    action: drop
+`, name, replica, targets)
 
 	if remoteWriteEndpoint != "" {
 		config = fmt.Sprintf(`
@@ -102,7 +112,7 @@ func TestQuery(t *testing.T) {
 	testutil.Ok(t, s.StartAndWaitReady(prom1, sidecar1, prom2, sidecar2, prom3, sidecar3, prom4, sidecar4))
 
 	// Querier. Both fileSD and directly by flags.
-	q, err := e2ethanos.NewQuerier(s.SharedDir(), "1", []string{sidecar1.GRPCNetworkEndpoint(), sidecar2.GRPCNetworkEndpoint(), receiver.GRPCNetworkEndpoint()}, []string{sidecar3.GRPCNetworkEndpoint(), sidecar4.GRPCNetworkEndpoint()}, nil, "", "")
+	q, err := e2ethanos.NewQuerier(s.SharedDir(), "1", []string{sidecar1.GRPCNetworkEndpoint(), sidecar2.GRPCNetworkEndpoint(), receiver.GRPCNetworkEndpoint()}, []string{sidecar3.GRPCNetworkEndpoint(), sidecar4.GRPCNetworkEndpoint()}, nil, nil, nil, nil, "", "")
 	testutil.Ok(t, err)
 	testutil.Ok(t, s.StartAndWaitReady(q))
 
@@ -182,6 +192,9 @@ func TestQueryExternalPrefixWithoutReverseProxy(t *testing.T) {
 		nil,
 		nil,
 		nil,
+		nil,
+		nil,
+		nil,
 		"",
 		externalPrefix,
 	)
@@ -205,13 +218,16 @@ func TestQueryExternalPrefix(t *testing.T) {
 		nil,
 		nil,
 		nil,
+		nil,
+		nil,
+		nil,
 		"",
 		externalPrefix,
 	)
 	testutil.Ok(t, err)
 	testutil.Ok(t, s.StartAndWaitReady(q))
 
-	querierURL := urlParse(t, "http://"+q.HTTPEndpoint()+"/"+externalPrefix)
+	querierURL := mustURLParse(t, "http://"+q.HTTPEndpoint()+"/"+externalPrefix)
 
 	querierProxy := httptest.NewServer(e2ethanos.NewSingleHostReverseProxy(querierURL, externalPrefix))
 	t.Cleanup(querierProxy.Close)
@@ -234,13 +250,16 @@ func TestQueryExternalPrefixAndRoutePrefix(t *testing.T) {
 		nil,
 		nil,
 		nil,
+		nil,
+		nil,
+		nil,
 		routePrefix,
 		externalPrefix,
 	)
 	testutil.Ok(t, err)
 	testutil.Ok(t, s.StartAndWaitReady(q))
 
-	querierURL := urlParse(t, "http://"+q.HTTPEndpoint()+"/"+routePrefix)
+	querierURL := mustURLParse(t, "http://"+q.HTTPEndpoint()+"/"+routePrefix)
 
 	querierProxy := httptest.NewServer(e2ethanos.NewSingleHostReverseProxy(querierURL, externalPrefix))
 	t.Cleanup(querierProxy.Close)
@@ -271,6 +290,9 @@ func TestQueryLabelNames(t *testing.T) {
 		[]string{sidecar1.GRPCNetworkEndpoint(), sidecar2.GRPCNetworkEndpoint(), receiver.GRPCNetworkEndpoint()},
 		[]string{},
 		nil,
+		nil,
+		nil,
+		nil,
 		"",
 		"",
 	)
@@ -282,14 +304,28 @@ func TestQueryLabelNames(t *testing.T) {
 	t.Cleanup(cancel)
 
 	now := time.Now()
-	labelNames(t, ctx, q.HTTPEndpoint(), timestamp.FromTime(now.Add(-time.Hour)), timestamp.FromTime(now.Add(time.Hour)), func(res []string) bool {
+	labelNames(t, ctx, q.HTTPEndpoint(), nil, timestamp.FromTime(now.Add(-time.Hour)), timestamp.FromTime(now.Add(time.Hour)), func(res []string) bool {
 		return len(res) > 0
 	})
 
 	// Outside time range.
-	labelNames(t, ctx, q.HTTPEndpoint(), timestamp.FromTime(now.Add(-24*time.Hour)), timestamp.FromTime(now.Add(-23*time.Hour)), func(res []string) bool {
+	labelNames(t, ctx, q.HTTPEndpoint(), nil, timestamp.FromTime(now.Add(-24*time.Hour)), timestamp.FromTime(now.Add(-23*time.Hour)), func(res []string) bool {
 		return len(res) == 0
 	})
+
+	labelNames(t, ctx, q.HTTPEndpoint(), []storepb.LabelMatcher{{Type: storepb.LabelMatcher_EQ, Name: "__name__", Value: "up"}},
+		timestamp.FromTime(now.Add(-time.Hour)), timestamp.FromTime(now.Add(time.Hour)), func(res []string) bool {
+			// Expected result: [__name__, instance, job, prometheus, replica]
+			return len(res) == 7
+		},
+	)
+
+	// There is no matched series.
+	labelNames(t, ctx, q.HTTPEndpoint(), []storepb.LabelMatcher{{Type: storepb.LabelMatcher_EQ, Name: "__name__", Value: "foobar"}},
+		timestamp.FromTime(now.Add(-time.Hour)), timestamp.FromTime(now.Add(time.Hour)), func(res []string) bool {
+			return len(res) == 0
+		},
+	)
 }
 
 func TestQueryLabelValues(t *testing.T) {
@@ -315,6 +351,9 @@ func TestQueryLabelValues(t *testing.T) {
 		[]string{sidecar1.GRPCNetworkEndpoint(), sidecar2.GRPCNetworkEndpoint(), receiver.GRPCNetworkEndpoint()},
 		[]string{},
 		nil,
+		nil,
+		nil,
+		nil,
 		"",
 		"",
 	)
@@ -326,48 +365,61 @@ func TestQueryLabelValues(t *testing.T) {
 	t.Cleanup(cancel)
 
 	now := time.Now()
-	labelValues(t, ctx, q.HTTPEndpoint(), "instance", timestamp.FromTime(now.Add(-time.Hour)), timestamp.FromTime(now.Add(time.Hour)), func(res []string) bool {
-		return len(res) > 0
+	labelValues(t, ctx, q.HTTPEndpoint(), "instance", nil, timestamp.FromTime(now.Add(-time.Hour)), timestamp.FromTime(now.Add(time.Hour)), func(res []string) bool {
+		return len(res) == 1 && res[0] == "localhost:9090"
 	})
 
 	// Outside time range.
-	labelValues(t, ctx, q.HTTPEndpoint(), "instance", timestamp.FromTime(now.Add(-24*time.Hour)), timestamp.FromTime(now.Add(-23*time.Hour)), func(res []string) bool {
+	labelValues(t, ctx, q.HTTPEndpoint(), "instance", nil, timestamp.FromTime(now.Add(-24*time.Hour)), timestamp.FromTime(now.Add(-23*time.Hour)), func(res []string) bool {
 		return len(res) == 0
 	})
+
+	labelValues(t, ctx, q.HTTPEndpoint(), "__name__", []storepb.LabelMatcher{{Type: storepb.LabelMatcher_EQ, Name: "__name__", Value: "up"}},
+		timestamp.FromTime(now.Add(-time.Hour)), timestamp.FromTime(now.Add(time.Hour)), func(res []string) bool {
+			return len(res) == 1 && res[0] == "up"
+		},
+	)
+
+	labelValues(t, ctx, q.HTTPEndpoint(), "__name__", []storepb.LabelMatcher{{Type: storepb.LabelMatcher_EQ, Name: "__name__", Value: "foobar"}},
+		timestamp.FromTime(now.Add(-time.Hour)), timestamp.FromTime(now.Add(time.Hour)), func(res []string) bool {
+			return len(res) == 0
+		},
+	)
 }
 
 func checkNetworkRequests(t *testing.T, addr string) {
 	ctx, cancel := chromedp.NewContext(context.Background())
 	t.Cleanup(cancel)
 
-	var networkErrors []string
+	testutil.Ok(t, runutil.Retry(1*time.Minute, ctx.Done(), func() error {
+		var networkErrors []string
 
-	// Listen for failed network requests and push them to an array.
-	chromedp.ListenTarget(ctx, func(ev interface{}) {
-		switch ev := ev.(type) {
-		case *network.EventLoadingFailed:
-			networkErrors = append(networkErrors, ev.ErrorText)
+		// Listen for failed network requests and push them to an array.
+		chromedp.ListenTarget(ctx, func(ev interface{}) {
+			switch ev := ev.(type) {
+			case *network.EventLoadingFailed:
+				networkErrors = append(networkErrors, ev.ErrorText)
+			}
+		})
+
+		err := chromedp.Run(ctx,
+			network.Enable(),
+			chromedp.Navigate(addr),
+			chromedp.WaitVisible(`body`),
+		)
+
+		if err != nil {
+			return err
 		}
-	})
 
-	err := chromedp.Run(ctx,
-		network.Enable(),
-		chromedp.Navigate(addr),
-		chromedp.WaitVisible(`body`),
-	)
-	testutil.Ok(t, err)
-
-	err = func() error {
 		if len(networkErrors) > 0 {
-			return fmt.Errorf("some network requests failed: %s", strings.Join(networkErrors, "; "))
+			err = fmt.Errorf("some network requests failed: %s", strings.Join(networkErrors, "; "))
 		}
-		return nil
-	}()
-
-	testutil.Ok(t, err)
+		return err
+	}))
 }
 
-func urlParse(t *testing.T, addr string) *url.URL {
+func mustURLParse(t *testing.T, addr string) *url.URL {
 	u, err := url.Parse(addr)
 	testutil.Ok(t, err)
 
@@ -383,7 +435,7 @@ func instantQuery(t *testing.T, ctx context.Context, addr string, q string, opts
 	logger := log.NewLogfmtLogger(os.Stdout)
 	logger = log.With(logger, "ts", log.DefaultTimestampUTC)
 	testutil.Ok(t, runutil.RetryWithLog(logger, time.Second, ctx.Done(), func() error {
-		res, warnings, err := promclient.NewDefaultClient().QueryInstant(ctx, urlParse(t, "http://"+addr), q, time.Now(), opts)
+		res, warnings, err := promclient.NewDefaultClient().QueryInstant(ctx, mustURLParse(t, "http://"+addr), q, time.Now(), opts)
 		if err != nil {
 			return err
 		}
@@ -422,13 +474,13 @@ func queryAndAssert(t *testing.T, ctx context.Context, addr string, q string, op
 	testutil.Equals(t, expected, result)
 }
 
-func labelNames(t *testing.T, ctx context.Context, addr string, start, end int64, check func(res []string) bool) {
+func labelNames(t *testing.T, ctx context.Context, addr string, matchers []storepb.LabelMatcher, start, end int64, check func(res []string) bool) {
 	t.Helper()
 
 	logger := log.NewLogfmtLogger(os.Stdout)
 	logger = log.With(logger, "ts", log.DefaultTimestampUTC)
-	testutil.Ok(t, runutil.RetryWithLog(logger, time.Second, ctx.Done(), func() error {
-		res, err := promclient.NewDefaultClient().LabelNamesInGRPC(ctx, urlParse(t, "http://"+addr), start, end)
+	testutil.Ok(t, runutil.RetryWithLog(logger, 2*time.Second, ctx.Done(), func() error {
+		res, err := promclient.NewDefaultClient().LabelNamesInGRPC(ctx, mustURLParse(t, "http://"+addr), matchers, start, end)
 		if err != nil {
 			return err
 		}
@@ -436,17 +488,18 @@ func labelNames(t *testing.T, ctx context.Context, addr string, start, end int64
 			return nil
 		}
 
-		return errors.Errorf("unexpected results size %d", len(res))
+		return errors.Errorf("unexpected results %v", res)
 	}))
 }
 
-func labelValues(t *testing.T, ctx context.Context, addr, label string, start, end int64, check func(res []string) bool) {
+//nolint:unparam
+func labelValues(t *testing.T, ctx context.Context, addr, label string, matchers []storepb.LabelMatcher, start, end int64, check func(res []string) bool) {
 	t.Helper()
 
 	logger := log.NewLogfmtLogger(os.Stdout)
 	logger = log.With(logger, "ts", log.DefaultTimestampUTC)
-	testutil.Ok(t, runutil.RetryWithLog(logger, time.Second, ctx.Done(), func() error {
-		res, err := promclient.NewDefaultClient().LabelValuesInGRPC(ctx, urlParse(t, "http://"+addr), label, start, end)
+	testutil.Ok(t, runutil.RetryWithLog(logger, 2*time.Second, ctx.Done(), func() error {
+		res, err := promclient.NewDefaultClient().LabelValuesInGRPC(ctx, mustURLParse(t, "http://"+addr), label, matchers, start, end)
 		if err != nil {
 			return err
 		}
@@ -454,7 +507,25 @@ func labelValues(t *testing.T, ctx context.Context, addr, label string, start, e
 			return nil
 		}
 
-		return errors.Errorf("unexpected results size %d", len(res))
+		return errors.Errorf("unexpected results %v", res)
+	}))
+}
+
+func series(t *testing.T, ctx context.Context, addr string, matchers []*labels.Matcher, start int64, end int64, check func(res []map[string]string) bool) {
+	t.Helper()
+
+	logger := log.NewLogfmtLogger(os.Stdout)
+	logger = log.With(logger, "ts", log.DefaultTimestampUTC)
+	testutil.Ok(t, runutil.RetryWithLog(logger, 2*time.Second, ctx.Done(), func() error {
+		res, err := promclient.NewDefaultClient().SeriesInGRPC(ctx, mustURLParse(t, "http://"+addr), matchers, start, end)
+		if err != nil {
+			return err
+		}
+		if check(res) {
+			return nil
+		}
+
+		return errors.Errorf("unexpected results %v", res)
 	}))
 }
 
@@ -465,7 +536,7 @@ func rangeQuery(t *testing.T, ctx context.Context, addr string, q string, start,
 	logger := log.NewLogfmtLogger(os.Stdout)
 	logger = log.With(logger, "ts", log.DefaultTimestampUTC)
 	testutil.Ok(t, runutil.RetryWithLog(logger, time.Second, ctx.Done(), func() error {
-		res, warnings, err := promclient.NewDefaultClient().QueryRange(ctx, urlParse(t, "http://"+addr), q, start, end, step, opts)
+		res, warnings, err := promclient.NewDefaultClient().QueryRange(ctx, mustURLParse(t, "http://"+addr), q, start, end, step, opts)
 		if err != nil {
 			return err
 		}

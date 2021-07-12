@@ -23,7 +23,10 @@ func TestDiffVarintCodec(t *testing.T) {
 	chunksDir, err := ioutil.TempDir("", "diff_varint_codec")
 	testutil.Ok(t, err)
 
-	h, err := tsdb.NewHead(nil, nil, nil, 1000, chunksDir, nil, tsdb.DefaultStripeSize, nil)
+	headOpts := tsdb.DefaultHeadOptions()
+	headOpts.ChunkDirRoot = chunksDir
+	headOpts.ChunkRange = 1000
+	h, err := tsdb.NewHead(nil, nil, nil, headOpts)
 	testutil.Ok(t, err)
 	defer func() {
 		testutil.Ok(t, h.Close())

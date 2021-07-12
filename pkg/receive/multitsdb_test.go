@@ -18,7 +18,9 @@ import (
 	"github.com/prometheus/prometheus/tsdb"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/thanos-io/thanos/pkg/block/metadata"
 	"github.com/thanos-io/thanos/pkg/runutil"
+	"github.com/thanos-io/thanos/pkg/store/labelpb"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
 	"github.com/thanos-io/thanos/pkg/testutil"
 )
@@ -32,15 +34,16 @@ func TestMultiTSDB(t *testing.T) {
 	t.Run("run fresh", func(t *testing.T) {
 		m := NewMultiTSDB(
 			dir, logger, prometheus.NewRegistry(), &tsdb.Options{
-				MinBlockDuration:  int64(2 * time.Hour / time.Millisecond),
-				MaxBlockDuration:  int64(2 * time.Hour / time.Millisecond),
-				RetentionDuration: int64(6 * time.Hour / time.Millisecond),
+				MinBlockDuration:  (2 * time.Hour).Milliseconds(),
+				MaxBlockDuration:  (2 * time.Hour).Milliseconds(),
+				RetentionDuration: (6 * time.Hour).Milliseconds(),
 				NoLockfile:        true,
 			},
 			labels.FromStrings("replica", "01"),
 			"tenant_id",
 			nil,
 			false,
+			metadata.NoneFunc,
 		)
 		defer func() { testutil.Ok(t, m.Close()) }()
 
@@ -59,11 +62,11 @@ func TestMultiTSDB(t *testing.T) {
 			return err
 		}))
 
-		_, err = a.Add(labels.FromStrings("a", "1", "b", "2"), 1, 2.41241)
+		_, err = a.Append(0, labels.FromStrings("a", "1", "b", "2"), 1, 2.41241)
 		testutil.Ok(t, err)
-		_, err = a.Add(labels.FromStrings("a", "1", "b", "2"), 2, 3.41241)
+		_, err = a.Append(0, labels.FromStrings("a", "1", "b", "2"), 2, 3.41241)
 		testutil.Ok(t, err)
-		_, err = a.Add(labels.FromStrings("a", "1", "b", "2"), 3, 4.41241)
+		_, err = a.Append(0, labels.FromStrings("a", "1", "b", "2"), 3, 4.41241)
 		testutil.Ok(t, err)
 		testutil.Ok(t, a.Commit())
 
@@ -86,11 +89,11 @@ func TestMultiTSDB(t *testing.T) {
 			return err
 		}))
 
-		_, err = a.Add(labels.FromStrings("a", "1", "b", "2"), 1, 20.41241)
+		_, err = a.Append(0, labels.FromStrings("a", "1", "b", "2"), 1, 20.41241)
 		testutil.Ok(t, err)
-		_, err = a.Add(labels.FromStrings("a", "1", "b", "2"), 2, 30.41241)
+		_, err = a.Append(0, labels.FromStrings("a", "1", "b", "2"), 2, 30.41241)
 		testutil.Ok(t, err)
-		_, err = a.Add(labels.FromStrings("a", "1", "b", "2"), 3, 40.41241)
+		_, err = a.Append(0, labels.FromStrings("a", "1", "b", "2"), 3, 40.41241)
 		testutil.Ok(t, err)
 		testutil.Ok(t, a.Commit())
 
@@ -99,15 +102,16 @@ func TestMultiTSDB(t *testing.T) {
 	t.Run("run on existing storage", func(t *testing.T) {
 		m := NewMultiTSDB(
 			dir, logger, prometheus.NewRegistry(), &tsdb.Options{
-				MinBlockDuration:  int64(2 * time.Hour / time.Millisecond),
-				MaxBlockDuration:  int64(2 * time.Hour / time.Millisecond),
-				RetentionDuration: int64(6 * time.Hour / time.Millisecond),
+				MinBlockDuration:  (2 * time.Hour).Milliseconds(),
+				MaxBlockDuration:  (2 * time.Hour).Milliseconds(),
+				RetentionDuration: (6 * time.Hour).Milliseconds(),
 				NoLockfile:        true,
 			},
 			labels.FromStrings("replica", "01"),
 			"tenant_id",
 			nil,
 			false,
+			metadata.NoneFunc,
 		)
 		defer func() { testutil.Ok(t, m.Close()) }()
 
@@ -141,13 +145,13 @@ func TestMultiTSDB(t *testing.T) {
 var (
 	expectedFooResp = []storepb.Series{
 		{
-			Labels: []storepb.Label{{Name: "a", Value: "1"}, {Name: "b", Value: "2"}, {Name: "replica", Value: "01"}, {Name: "tenant_id", Value: "foo"}},
+			Labels: []labelpb.ZLabel{{Name: "a", Value: "1"}, {Name: "b", Value: "2"}, {Name: "replica", Value: "01"}, {Name: "tenant_id", Value: "foo"}},
 			Chunks: []storepb.AggrChunk{{MinTime: 1, MaxTime: 3, Raw: &storepb.Chunk{Data: []byte("\000\003\002@\003L\235\2354X\315\001\330\r\257Mui\251\327:U")}}},
 		},
 	}
 	expectedBarResp = []storepb.Series{
 		{
-			Labels: []storepb.Label{{Name: "a", Value: "1"}, {Name: "b", Value: "2"}, {Name: "replica", Value: "01"}, {Name: "tenant_id", Value: "bar"}},
+			Labels: []labelpb.ZLabel{{Name: "a", Value: "1"}, {Name: "b", Value: "2"}, {Name: "replica", Value: "01"}, {Name: "tenant_id", Value: "bar"}},
 			Chunks: []storepb.AggrChunk{{MinTime: 1, MaxTime: 3, Raw: &storepb.Chunk{Data: []byte("\000\003\002@4i\223\263\246\213\032\001\330\035i\337\322\352\323S\256t\270")}}},
 		},
 	}
@@ -253,4 +257,47 @@ func (s *storeSeriesServer) Send(r *storepb.SeriesResponse) error {
 
 func (s *storeSeriesServer) Context() context.Context {
 	return s.ctx
+}
+
+func BenchmarkMultiTSDB(b *testing.B) {
+	dir, err := ioutil.TempDir("", "multitsdb")
+	testutil.Ok(b, err)
+	defer func() { testutil.Ok(b, os.RemoveAll(dir)) }()
+
+	m := NewMultiTSDB(dir, log.NewNopLogger(), prometheus.NewRegistry(), &tsdb.Options{
+		MinBlockDuration:  (2 * time.Hour).Milliseconds(),
+		MaxBlockDuration:  (2 * time.Hour).Milliseconds(),
+		RetentionDuration: (6 * time.Hour).Milliseconds(),
+		NoLockfile:        true,
+	}, labels.FromStrings("replica", "test"),
+		"tenant_id",
+		nil,
+		false,
+		metadata.NoneFunc,
+	)
+	defer func() { testutil.Ok(b, m.Close()) }()
+
+	testutil.Ok(b, m.Flush())
+	testutil.Ok(b, m.Open())
+
+	app, err := m.TenantAppendable("foo")
+	testutil.Ok(b, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	var a storage.Appender
+	testutil.Ok(b, runutil.Retry(1*time.Second, ctx.Done(), func() error {
+		a, err = app.Appender(context.Background())
+		return err
+	}))
+
+	l := labels.FromStrings("a", "1", "b", "2")
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		_, _ = a.Append(0, l, int64(i), float64(i))
+	}
 }
