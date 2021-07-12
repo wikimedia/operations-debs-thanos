@@ -7,6 +7,9 @@
 package labelpb
 
 import (
+	"encoding/json"
+	"fmt"
+	"io"
 	"sort"
 	"strings"
 	"unsafe"
